@@ -1,0 +1,75 @@
+[==========] Running 13 tests from 2 test suites.
+[----------] Global test environment set-up.
+[----------] 7 tests from OrderBookTest
+[ RUN      ] OrderBookTest.AddBidOrder
+[       OK ] OrderBookTest.AddBidOrder (0 ms)
+[ RUN      ] OrderBookTest.AddAskOrder
+[       OK ] OrderBookTest.AddAskOrder (0 ms)
+[ RUN      ] OrderBookTest.BestBidAsk
+[       OK ] OrderBookTest.BestBidAsk (0 ms)
+[ RUN      ] OrderBookTest.CancelOrder
+[       OK ] OrderBookTest.CancelOrder (0 ms)
+[ RUN      ] OrderBookTest.ExecuteMarketOrderFullFill
+[       OK ] OrderBookTest.ExecuteMarketOrderFullFill (0 ms)
+[ RUN      ] OrderBookTest.ExecuteMarketOrderPartialFill
+[       OK ] OrderBookTest.ExecuteMarketOrderPartialFill (0 ms)
+[ RUN      ] OrderBookTest.FIFOOrdering
+[       OK ] OrderBookTest.FIFOOrdering (0 ms)
+[----------] 7 tests from OrderBookTest (0 ms total)
+
+[----------] 6 tests from OrderBookStressTest
+[ RUN      ] OrderBookStressTest.Insert100KOrders
+
+[Insert 100K Orders]
+  addOrder                            |     100000 ops |    0.021 sec |      4861443 ops/sec |    205.7 ns/op
+[       OK ] OrderBookStressTest.Insert100KOrders (21 ms)
+[ RUN      ] OrderBookStressTest.AddCancelMixed
+
+[Add/Cancel Mixed - 200K ops]
+  Adds: 139930, Cancels: 60070
+  mixed add/cancel                    |     200000 ops |    0.023 sec |      8577289 ops/sec |    116.6 ns/op
+[       OK ] OrderBookStressTest.AddCancelMixed (29 ms)
+[ RUN      ] OrderBookStressTest.MarketOrderExecution
+
+[Market Order Execution]
+  Initial book: 50000 orders
+  Bid levels: 2001, Ask levels: 2001
+  executeMarketOrder                  |       1000 ops |    0.000 sec |      4650060 ops/sec |    215.1 ns/op
+  Total filled: 10497181 shares
+  Orders remaining: 46177
+[       OK ] OrderBookStressTest.MarketOrderExecution (7 ms)
+[ RUN      ] OrderBookStressTest.LatencyDistribution
+
+[addOrder Latency Distribution - 100000 samples]
+  Min  :       41 ns
+  p50  :       91 ns
+  p90  :      109 ns
+  p99  :      145 ns
+  p99.9:     1070 ns
+  Max  :   778903 ns
+[       OK ] OrderBookStressTest.LatencyDistribution (19 ms)
+[ RUN      ] OrderBookStressTest.OneMillionOrders
+
+[1 Million Orders Stress Test]
+  Progress: 200000 orders inserted
+  Progress: 400000 orders inserted
+  Progress: 600000 orders inserted
+  Progress: 800000 orders inserted
+  Progress: 1000000 orders inserted
+  1M orders insertion                 |    1000000 ops |    0.176 sec |      5672467 ops/sec |    176.3 ns/op
+  Active bid levels: 4001
+  Active ask levels: 4001
+  Best bid: 120.000000
+  Best ask: 80.000000
+[       OK ] OrderBookStressTest.OneMillionOrders (195 ms)
+[ RUN      ] OrderBookStressTest.InvariantsHoldUnderStress
+
+[Invariant Stress Test]
+  Completed 50000 random ops, no invariant violations
+  Final orders: 46
+[       OK ] OrderBookStressTest.InvariantsHoldUnderStress (24 ms)
+[----------] 6 tests from OrderBookStressTest (297 ms total)
+
+[----------] Global test environment tear-down
+[==========] 13 tests from 2 test suites ran. (297 ms total)
+[  PASSED  ] 13 tests.

@@ -61,7 +61,7 @@ bool OrderBook::cancelOrder(OrderId order_id) {
     
     // free memory
     delete order;
-    
+    total_orders_--;
     return true;
 }
 

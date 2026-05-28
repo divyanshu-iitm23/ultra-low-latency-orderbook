@@ -1,0 +1,45 @@
+================================================================
+  ULTRA-LOW-LATENCY ORDER BOOK - MANUAL TEST SUITE
+  Testing simple implementation with large datasets
+================================================================
+
+================================================================
+  DEMO 3: One Million Operations Stress Test
+================================================================
+Running 1,000,000 random operations...
+Distribution: 70% add, 25% cancel, 5% market order
+
+  100,000 ops completed... (19.2 ms elapsed)
+  200,000 ops completed... (32.4 ms elapsed)
+  300,000 ops completed... (46.9 ms elapsed)
+  400,000 ops completed... (61.7 ms elapsed)
+  500,000 ops completed... (86.5 ms elapsed)
+  600,000 ops completed... (102.6 ms elapsed)
+  700,000 ops completed... (119.2 ms elapsed)
+  800,000 ops completed... (136.3 ms elapsed)
+  900,000 ops completed... (154.9 ms elapsed)
+  1,000,000 ops completed... (194.2 ms elapsed)
+
+--- Results ---
+Total time:      194.21 ms
+Throughput:      5149066 ops/sec
+Avg latency:     194 ns/op
+
+Operation breakdown:
+  Adds:          700,805
+  Cancels:       177,457
+  Market orders: 50,264
+  Shares filled: 82,568,103
+
+Final book state:
+  Active orders:    373,041
+  Bid levels:       825
+  Ask levels:       842
+  Best bid/ask:     104.880000 / 95.270000
+  Spread:           -9.610000
+
+================================================================
+  ALL TESTS COMPLETED
+================================================================
+Total runtime: 0.23 seconds
+
