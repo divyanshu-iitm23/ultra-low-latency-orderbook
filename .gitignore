@@ -1,0 +1,35 @@
+cat > .gitignore << 'EOF'
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Debug/profile output
+*.log
+perf.data*
+
+# Data files
+data/*.itch
+data/*.pcap
+EOF
