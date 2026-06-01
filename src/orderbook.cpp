@@ -6,7 +6,7 @@ namespace orderbook {
 
 OrderId OrderBook::addOrder(Side side, Price price, Quantity quantity) {
     // creating new order
-    Order* order = new Order(next_order_id_++, side, price, quantity);
+    Order* order = order_pool_.allocate(next_order_id_++, side, price, quantity);
     
     // adding to lookup map
     orders_[order->id] = order;
@@ -60,7 +60,8 @@ bool OrderBook::cancelOrder(OrderId order_id) {
     orders_.erase(it);
     
     // free memory
-    delete order;
+    // delete order;
+    order_pool_.deallocate(order);
     total_orders_--;
     return true;
 }

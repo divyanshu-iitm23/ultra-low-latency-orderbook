@@ -1,6 +1,7 @@
 #pragma once
 
 #include "price_level.hpp"
+#include "object_pool.hpp"
 #include <map>
 #include <unordered_map>
 #include <memory>
@@ -23,19 +24,17 @@ private:
     OrderId next_order_id_;
 
     size_t total_orders_;
+    ObjectPool<Order> order_pool_;
     
 public:
-    OrderBook() 
+    // Size the pool up front. Default 65536 orders; grows automatically if exceeded.
+    explicit OrderBook(size_t initial_pool_capacity = 1 << 16)
         : next_order_id_(1)
         , total_orders_(0)
+        , order_pool_(initial_pool_capacity)   // ← ADD
     {}
-    
-    ~OrderBook() {
-        // cleaning up all orders
-        for (auto& pair : orders_) {
-            delete pair.second;
-        }
-    }
+
+    ~OrderBook() = default;
     
     // adding a limit order
     OrderId addOrder(Side side, Price price, Quantity quantity);
