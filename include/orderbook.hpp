@@ -27,11 +27,11 @@ private:
     ObjectPool<Order> order_pool_;
     
 public:
-    // Size the pool up front. Default 65536 orders; grows automatically if exceeded.
+    // size the pool up front, default 65536 orders, grows automatically if exceeded
     explicit OrderBook(size_t initial_pool_capacity = 1 << 16)
         : next_order_id_(1)
         , total_orders_(0)
-        , order_pool_(initial_pool_capacity)   // ← ADD
+        , order_pool_(initial_pool_capacity)
     {}
 
     ~OrderBook() = default;

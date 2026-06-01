@@ -9,21 +9,21 @@
 Running 1,000,000 random operations...
 Distribution: 70% add, 25% cancel, 5% market order
 
-  100,000 ops completed... (29.7 ms elapsed)
-  200,000 ops completed... (54.6 ms elapsed)
-  300,000 ops completed... (76.3 ms elapsed)
-  400,000 ops completed... (103.0 ms elapsed)
-  500,000 ops completed... (131.2 ms elapsed)
-  600,000 ops completed... (156.3 ms elapsed)
-  700,000 ops completed... (175.1 ms elapsed)
-  800,000 ops completed... (194.9 ms elapsed)
-  900,000 ops completed... (212.7 ms elapsed)
-  1,000,000 ops completed... (238.0 ms elapsed)
+  100,000 ops completed... (29.0 ms elapsed)
+  200,000 ops completed... (54.7 ms elapsed)
+  300,000 ops completed... (81.1 ms elapsed)
+  400,000 ops completed... (106.1 ms elapsed)
+  500,000 ops completed... (136.5 ms elapsed)
+  600,000 ops completed... (161.6 ms elapsed)
+  700,000 ops completed... (188.1 ms elapsed)
+  800,000 ops completed... (215.7 ms elapsed)
+  900,000 ops completed... (243.9 ms elapsed)
+  1,000,000 ops completed... (285.4 ms elapsed)
 
 --- Results ---
-Total time:      237.99 ms
-Throughput:      4201773 ops/sec
-Avg latency:     238 ns/op
+Total time:      285.39 ms
+Throughput:      3503956 ops/sec
+Avg latency:     285 ns/op
 
 Operation breakdown:
   Adds:          700,805
@@ -41,5 +41,5 @@ Final book state:
 ================================================================
   ALL TESTS COMPLETED
 ================================================================
-Total runtime: 0.25 seconds
+Total runtime: 0.30 seconds
 

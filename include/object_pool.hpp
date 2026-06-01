@@ -8,10 +8,10 @@
 
 namespace orderbook {
 
-// A growing, fixed-size object pool.
-// - Pre-allocates memory in chunks.
-// - allocate()/deallocate() are O(1) pointer swaps (no malloc in hot path).
-// - Uses an intrusive free list (free slots store the "next free" pointer).
+// growing,fixed-size object pool
+// -pre-allocates memory in chunks
+// -allocate()/deallocate() are O(1) pointer swaps (no malloc in hot path)
+// -uses an intrusive free list (free slots store the "next free" pointer)
 template <typename T>
 class ObjectPool {
 public:
@@ -25,27 +25,27 @@ public:
         addChunk(initial_capacity > 0 ? initial_capacity : chunk_size_);
     }
 
-    // Non-copyable: the pool owns raw memory.
+    // the pool owns raw memory
     ObjectPool(const ObjectPool&) = delete;
     ObjectPool& operator=(const ObjectPool&) = delete;
 
-    // Hand out a slot and construct a T in place with the given args.
+    // handing out a slot and construct a T in place with the given args
     template <typename... Args>
     T* allocate(Args&&... args) {
         if (!free_head_) {
-            addChunk(chunk_size_);   // grow on demand (rare, not in steady state)
+            addChunk(chunk_size_);   // grow on demand
         }
         Slot* slot = free_head_;
         free_head_ = slot->next;
         ++allocated_;
-        // Placement new: construct T directly into the slot's storage.
+        // constructing T directly into the slot's storage
         return new (&slot->storage) T(std::forward<Args>(args)...);
     }
 
-    // Destroy the T and return its slot to the free list.
+    // destroy the T and return its slot to the free list
     void deallocate(T* obj) {
         if (!obj) return;
-        obj->~T();                                      // run destructor
+        obj->~T();                                  // run destructor
         Slot* slot = reinterpret_cast<Slot*>(obj);      // slot addr == storage addr
         slot->next = free_head_;
         free_head_ = slot;
@@ -58,8 +58,8 @@ public:
     size_t numChunks() const { return chunks_.size(); }
 
 private:
-    // A slot holds EITHER a live T (storage) OR a free-list pointer (next).
-    // The union means the free list costs zero extra memory.
+    // slot will hold either a live T (storage) or a free-list pointer (next)
+    // the union means the free list costs zero extra memory
     union Slot {
         alignas(T) std::byte storage[sizeof(T)];
         Slot* next;
@@ -67,7 +67,7 @@ private:
 
     void addChunk(size_t n) {
         auto chunk = std::make_unique<Slot[]>(n);
-        // Thread every new slot onto the front of the free list.
+        // threading every new slot into the front of the free list
         for (size_t i = 0; i < n; ++i) {
             chunk[i].next = free_head_;
             free_head_ = &chunk[i];
