@@ -31,6 +31,10 @@ public:
     size_t getOrderCount() const { return order_count_; }
     bool isEmpty() const { return head_ == nullptr; }
     Order* getHead() const { return head_; }
+
+    // setters
+    void setPrice(Price p) { price_ = p; }
+    void adjustTotalQuantity(int64_t delta) { total_quantity_ += delta; }
     
     // adding order to the end (newest)
     void addOrder(Order* order) {

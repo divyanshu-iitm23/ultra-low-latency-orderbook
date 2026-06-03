@@ -31,7 +31,7 @@ public:
 
     // handing out a slot and construct a T in place with the given args
     template <typename... Args>
-    T* allocate(Args&&... args) {
+    T* allocate(Args&&... args) {           // packing types and args
         if (!free_head_) {
             addChunk(chunk_size_);   // grow on demand
         }
@@ -39,7 +39,7 @@ public:
         free_head_ = slot->next;
         ++allocated_;
         // constructing T directly into the slot's storage
-        return new (&slot->storage) T(std::forward<Args>(args)...);
+        return new (&slot->storage) T(std::forward<Args>(args)...);             // unpacking types and args
     }
 
     // destroy the T and return its slot to the free list

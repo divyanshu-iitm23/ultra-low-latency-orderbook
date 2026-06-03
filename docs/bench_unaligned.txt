@@ -1,0 +1,13 @@
+=== Order Book RDTSC Benchmark ===
+pinned to core      : 3
+TSC frequency       : 3.1112 GHz
+timer overhead      : 32 ticks (10.29 ns) [subtracted per-op]
+
+[Batch throughput]  addOrder mean = 102.7 ns/op  (9.74 M ops/s)
+
+[Per-op distribution]  median-of-7-runs, overhead-subtracted
+  p50   :    85.5 ns
+  p90   :   103.8 ns
+  p99   :   121.2 ns
+  p99.9 :   150.4 ns
+  max   : 660791.6 ns  (worst single sample; high variance)
