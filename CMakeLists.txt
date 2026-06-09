@@ -39,3 +39,12 @@ target_link_libraries(manual_test orderbook_lib)
 add_executable(benchmark_orderbook benchmarks/benchmark_orderbook.cpp)
 target_link_libraries(benchmark_orderbook orderbook_lib)
 target_compile_options(benchmark_orderbook PRIVATE -O3 -march=native)
+
+
+# ITCH tools
+add_executable(itch_replay benchmarks/itch_replay.cpp)
+target_compile_options(itch_replay PRIVATE -O3 -march=native)
+
+add_executable(itch_book_replay benchmarks/itch_book_replay.cpp)
+target_link_libraries(itch_book_replay orderbook_lib)
+target_compile_options(itch_book_replay PRIVATE -O3 -march=native)

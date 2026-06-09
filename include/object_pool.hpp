@@ -66,6 +66,8 @@ private:
     };
 
     void addChunk(size_t n) {
+        // n=4096
+        // allocates an array of n elements of type Slot on the heap and assigns it a unique ptr
         auto chunk = std::make_unique<Slot[]>(n);
         // threading every new slot into the front of the free list
         for (size_t i = 0; i < n; ++i) {

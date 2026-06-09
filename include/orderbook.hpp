@@ -24,7 +24,14 @@ public:
     }
     ~OrderBook()=default;
 
-    OrderId addOrder(Side side, Price price, Quantity quantity);
+    // book will assign the id to the orders
+
+    OrderId addOrder(Side side, Price price, Quantity quantity){
+        return addOrder(side, price, quantity, next_order_id_++);
+    }
+    // market-data path : caller supplies the exchange order reference as the id
+    OrderId addOrder(Side side, Price price, Quantity quantity, OrderId id);
+
     bool cancelOrder(OrderId id);
     Quantity executeMarketOrder(Side side, Quantity quantity);
     bool modifyOrder(OrderId id, Quantity new_quantity);

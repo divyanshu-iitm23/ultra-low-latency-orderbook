@@ -2,10 +2,10 @@
 #include <algorithm>
 namespace orderbook {
 
-OrderId OrderBook::addOrder(Side side, Price price, Quantity quantity) {
+OrderId OrderBook::addOrder(Side side, Price price, Quantity quantity, OrderId id) {
     if (!inRange(price)) return 0;
     int64_t idx = priceToIndex(price);
-    Order* o = order_pool_.allocate(next_order_id_++, side, price, quantity);           // step1: construct an order in the pool (say chunk[0])
+    Order* o = order_pool_.allocate(id, side, price, quantity);           // step1: construct an order in the pool (say chunk[0])
     orders_[o->id] = o;                                                              // step2: store pointer to that order in the map (id->chunk[0])
     if (side == Side::BUY) {
         bool wasEmpty = bid_levels_[idx].isEmpty();
