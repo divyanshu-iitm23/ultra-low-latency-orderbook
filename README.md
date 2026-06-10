@@ -5,10 +5,11 @@ three-part HFT systems- orderbook, FPGA packet parser and real-time latency dash
 **predictably** — minimizing the latency *tail*, which is what actually matters in
 high-frequency trading, where a single multi-microsecond spike is a lost trade.
 
-Every performance claim in this document was measured on real hardware (16-core bare-metal
-Linux) using a calibrated, cycle-accurate benchmark harness with a pinned core and
-median-of-seven runs. Numbers from a constrained verification environment are never quoted
-as results.
+Every performance claim in this document was measured on real hardware. Here's my setup :
+- OS/Kernel : Kali Linux
+- CPU Architecture : x86 (16 cores, profiling done on single pinned core)
+- IDE : vsCode
+- Every test result is median-of-seven-runs.
 
 ---
 
