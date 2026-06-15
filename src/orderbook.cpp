@@ -90,3 +90,67 @@ bool OrderBook::modifyOrder(OrderId id, Quantity new_quantity) {
     return true;
 }
 }
+
+// Matching engine
+namespace orderbook {
+
+Quantity OrderBook::match(Side side, Price limit, Quantity quantity, OrderId takerId,
+                          std::vector<Trade>& trades) {
+    Quantity rem = quantity;
+    if (side == Side::BUY) {
+        // Aggressive buy crosses asks from the lowest price up, while ask <= limit.
+        while (rem > 0 && best_ask_idx_ >= 0) {
+            Price ap = indexToPrice(best_ask_idx_);
+            if (ap > limit) break;                       // no longer crosses
+            PriceLevel& lvl = ask_levels_[best_ask_idx_];
+            while (rem > 0) {
+                Order* m = lvl.getHead();                 // FIFO: oldest resting first
+                if (!m) break;                            // level emptied
+                Quantity fill = std::min(rem, m->quantity);
+                trades.push_back({ap, fill, m->id, takerId, side});
+                rem -= fill;
+                if (fill == m->quantity) {                // maker fully filled -> remove
+                    OrderId mid = m->id;
+                    cancelOrder(mid);                     // updates level/bitmap/best/pool
+                } else {                                  // maker partially filled -> reduce
+                    m->quantity -= fill;
+                    lvl.adjustTotalQuantity(-(int64_t)fill);
+                }                                         // (rem is now 0 in the else branch)
+            }
+        }
+    } else {
+        // Aggressive sell crosses bids from the highest price down, while bid >= limit.
+        while (rem > 0 && best_bid_idx_ >= 0) {
+            Price bp = indexToPrice(best_bid_idx_);
+            if (bp < limit) break;
+            PriceLevel& lvl = bid_levels_[best_bid_idx_];
+            while (rem > 0) {
+                Order* m = lvl.getHead();
+                if (!m) break;
+                Quantity fill = std::min(rem, m->quantity);
+                trades.push_back({bp, fill, m->id, takerId, side});
+                rem -= fill;
+                if (fill == m->quantity) { OrderId mid = m->id; cancelOrder(mid); }
+                else { m->quantity -= fill; lvl.adjustTotalQuantity(-(int64_t)fill); }
+            }
+        }
+    }
+    return rem;
+}
+
+std::vector<Trade> OrderBook::submitLimit(Side side, Price price, Quantity quantity, OrderId takerId) {
+    std::vector<Trade> trades;
+    Quantity rem = match(side, price, quantity, takerId, trades);
+    if (rem > 0) addOrder(side, price, rem, takerId);    // rest the unfilled remainder
+    return trades;
+}
+
+std::vector<Trade> OrderBook::submitMarket(Side side, Quantity quantity, OrderId takerId) {
+    std::vector<Trade> trades;
+    Price limit = (side == Side::BUY) ? std::numeric_limits<Price>::max()
+                                      : std::numeric_limits<Price>::min();
+    match(side, limit, quantity, takerId, trades);            // remainder dropped (never rests)
+    return trades;
+}
+
+} // namespace orderbook

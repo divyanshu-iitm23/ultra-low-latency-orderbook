@@ -48,3 +48,7 @@ target_compile_options(itch_replay PRIVATE -O3 -march=native)
 add_executable(itch_book_replay benchmarks/itch_book_replay.cpp)
 target_link_libraries(itch_book_replay orderbook_lib)
 target_compile_options(itch_book_replay PRIVATE -O3 -march=native)
+
+# Matching Engine testing..
+add_executable(test_matching test_matching.cpp)
+target_link_libraries(test_matching orderbook_lib)

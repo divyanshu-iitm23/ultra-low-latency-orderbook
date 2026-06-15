@@ -4,7 +4,19 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <limits>
 namespace orderbook {
+
+// A trade (execution) produced by the matching engine.
+// By convention the execution price is the RESTING (maker) order's price, so an
+// aggressor that crosses gets price improvement.
+struct Trade {
+    Price    price;      // execution price = resting/maker order's price
+    Quantity quantity;   // shares traded
+    OrderId  makerId;    // resting order that was matched against
+    OrderId  takerId;    // incoming aggressive order
+    Side     takerSide;  // side of the aggressor
+};
 
 class OrderBook {
 public:
@@ -36,6 +48,17 @@ public:
     Quantity executeMarketOrder(Side side, Quantity quantity);
     bool modifyOrder(OrderId id, Quantity new_quantity);
 
+    // Matching engine..
+    // Submit an aggressive LIMIT order: match against the resting book in price-time
+    // priority, then rest any unfilled remainder at `price` under `takerId`.
+    // Returns the trades generated (empty if it rested without crossing).
+    // Guarantees the book is never crossed afterward.
+    std::vector<Trade> submitLimit(Side side, Price price, Quantity quantity, OrderId takerId);
+
+    // Submit a MARKET order: match at any price until filled or the book is exhausted.
+    // Never rests; any unfilled remainder is dropped. Returns the trades generated.
+    std::vector<Trade> submitMarket(Side side, Quantity quantity, OrderId takerId);
+
     Price getBestBid() const { return best_bid_idx_<0?0:indexToPrice(best_bid_idx_); }
     Price getBestAsk() const { return best_ask_idx_<0?0:indexToPrice(best_ask_idx_); }
     Price getSpread() const {
@@ -52,6 +75,13 @@ public:
     void printBook(int depth = 5) const;
 
 private:
+
+    // Core matcher: match up to `quantity` of an incoming `side` order against the opposing
+    // book, accepting prices "no worse than" `limit` (BUY: ask <= limit; SELL: bid >= limit).
+    // Appends executions to `trades`; returns the unfilled remaining quantity.
+    Quantity match(Side side, Price limit, Quantity quantity, OrderId takerId,
+                   std::vector<Trade>& trades);
+
     int64_t priceToIndex(Price p) const { return (int64_t)(p-min_price_); }
     Price indexToPrice(int64_t i) const { return min_price_+(Price)i; }
     bool inRange(Price p) const { return p>=min_price_ && p<=max_price_; }

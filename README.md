@@ -43,11 +43,8 @@ PHASE 1: ORDER BOOK ENGINE (Software)
     ├──  Parser → order book integration (addOrder-with-external-id, BookReplay)
     ├──  Reconstructed real AAPL book — non-crossed, $0.05 spread
     ├──  Batch report wrapper (run_itch_replays.sh → docs/)
-    ├──  perf profiling (real feed) — order book is ~1.6%; bottleneck is I/O + symbol filter
-    ├──  Symbol-filter optimization: strcmp → uint64_t compare (~13% → gone, measured)
-    ├──  Mid-session timestamp cutoff (reconstruct book "as of 11 AM")
-    ├──  MSFT/SPY cross-check (confirm the file's true date / prices)
-    ├──  Limit-order matching engine (Option B) + re-enable crossed-book test
+    ├──  perf profiling (real feed)
+    ├──  Limit-order matching engine (just an attempt)
     └──  End-to-end latency measurement (messages/sec on real feed)
 
 PHASE 2: REAL-TIME MONITORING DASHBOARD (Ops)
@@ -287,7 +284,7 @@ open-addressing table (expensive hash, lengthening linear probes, rehash-on-grow
 slower than a tuned `std::unordered_map`. Reverted. The dead-end is documented because the
 discipline it demonstrates — measure, then decide — is the point.
 
-### 6. Symbol filter: `strcmp` → `uint64_t` compare — **kept (real-feed win)**
+### 6. Symbol filter: `strcmp` → `uint64_t` compare — **kept**
 Surfaced by profiling the ITCH replay, not the synthetic benchmark. The replay filters the
 feed to one symbol; the original filter did a `strcmp` of the 8-byte stock field on every
 Add message. Profiling showed `__strcmp_avx2` was **12.88%** of replay time — about **eight
@@ -340,6 +337,8 @@ one-off interrupt / SMI on the core). Removing it requires platform-level core i
 (`isolcpus`, `nohz_full`, IRQ affinity) — a deployment concern, not a data-structure change.
 Knowing where software ends and the platform begins is part of the engineering, not an
 evasion of it.
+
+Checkout flamegraphs in `/docs` .
 
 ### Part B — real ITCH feed: where do cycles actually go?
 
@@ -496,38 +495,182 @@ Two honest notes on the data:
 
 ---
 
+## Matching Engine *(attempting trade execution)*
+ 
+Everything before this point is a **storage** book: `addOrder` inserts at a price level and
+never checks whether the order crosses the opposite side. That is exactly why a storage book
+is *allowed* to be crossed. The matching engine changes the contract: an incoming aggressive
+order is matched against the resting book in **price-time priority** before any remainder is
+allowed to rest. With matching in place, the book can never be crossed — and the deferred
+invariant returns as an enforced, tested guarantee.
+ 
+### Semantics
+ 
+Four rules define the behavior, following standard exchange conventions:
+ 
+1. **Trades execute at the resting (maker) order's price.** A buy limit at $10.05 hitting a
+   resting ask at $10.00 trades at **$10.00** — the aggressor receives price improvement.
+2. **Price priority, then time priority.** The best opposing level is swept first; within a
+   level, the FIFO head (the oldest resting order) fills first.
+3. **Partial fills in both directions.** A partially-hit resting order stays in place with
+   reduced quantity, *keeping its time priority*. A partially-filled incoming limit rests its
+   remainder at its limit price.
+4. **Market orders never rest.** They sweep at any price until filled or the opposing book is
+   exhausted; any unfilled remainder is dropped.
+### API
+ 
+```cpp
+struct Trade {
+    Price    price;      // execution price = resting/maker order's price
+    Quantity quantity;   // shares traded
+    OrderId  makerId;    // resting order matched against
+    OrderId  takerId;    // incoming aggressive order
+    Side     takerSide;  // side of the aggressor
+};
+ 
+std::vector<Trade> submitLimit (Side side, Price price, Quantity qty, OrderId takerId);
+std::vector<Trade> submitMarket(Side side, Quantity qty, OrderId takerId);
+```
+ 
+Both are built on one private `match()` routine that walks the opposing ladder via the
+occupancy bitmap (best price first) and each level's FIFO list. A fully-filled maker is
+removed through the already-tested `cancelOrder` path — inheriting the level/bitmap/
+best-price/pool bookkeeping for free — while a partially-filled maker is reduced in place.
+`submitLimit` rests any unfilled remainder through the existing `addOrder`. The matcher is
+therefore a thin orchestration layer over operations the book already proved correct.
+ 
+### Verification
+ 
+A scripted scenario test (`test_matching`) drives the matcher through hand-computed
+expectations: FIFO order within a level, multi-level sweeps in strict price order,
+maker-priced executions, partial fills on both maker and taker sides, non-crossing limits
+resting without generating trades, and a market order sweeping the entire opposing book —
+with the **non-crossed invariant asserted after every single operation**. The addition is
+purely additive: the ITCH-replay integration test and the parser round-trip test continue to
+pass unchanged. (Matching correctness is test-verified; matching *latency* has not yet been
+benchmarked with the RDTSC harness — listed under extensions.)
+ 
+### Scope — what this matcher is and isn't
+ 
+This is a deliberately **core** matcher: limit + market orders, price-time priority, partial
+fills, maker-priced trades. It does not implement production order-type refinements —
+IOC/FOK time-in-force, self-trade prevention, iceberg/hidden orders, pro-rata allocation, or
+auction crosses. Two known deviations from the project's own rules are recorded for honesty:
+the trade-report `std::vector` allocates on the matching hot path (a production matcher
+would use a caller-provided buffer or callback), and `modifyOrder` does not implement
+lose-priority-on-quantity-increase semantics (matching itself only ever *reduces* makers, so
+the matcher is unaffected). All are listed under *Deferred Work / Extensions* — naming the
+omissions is part of the engineering.
+ 
+### Why the ITCH replay does not call the matcher
+ 
+ITCH is a **post-matching** feed: NASDAQ's engine already matched the orders, and the tape
+records the results (adds of orders that rested; executions the venue decided). Replaying
+ITCH through a local matcher would be wrong — it would re-decide outcomes the exchange
+already decided. So reconstruction (`BookReplay`) and matching (`submitLimit`/`submitMarket`)
+are deliberately **separate capabilities sharing one book**: replay rebuilds a venue's book
+faithfully; the matcher turns that book into an exchange-style engine for new order flow.
+ 
+---
+ 
+## Phase 1: Conclusion
+ 
+Phase 1 set out to build the software core of an HFT stack — a limit order book that is
+fast, predictable, correct, and real. All four are demonstrated, each with evidence:
+ 
+| Claim | Evidence |
+|---|---|
+| **Fast** | 26.6 ns mean `addOrder` (RDTSC harness, pinned core, median-of-7, real hardware) |
+| **Predictable** | worst case 665 µs → 24 µs (**28×**); residual tail *proven* OS/hardware jitter |
+| **Real** | reconstructs a live NASDAQ AAPL book from raw ITCH tape — non-crossed |
+| **Complete** | price-time-priority matching engine; crossed-book invariant enforced and tested |
+| **Efficient in context** | the order book is ~1.6% of real-feed replay runtime; the rest is I/O |
+ 
+The arc of the phase: a correct storage book → measured optimization with
+documented dead ends → real market data and a matching engine. One
+detail bookends the whole phase: the **crossed-book invariant** was written,
+correctly *deferred* because a storage-only book may legitimately be crossed (the test was
+wrong, not the book), returned as the decisive *validator* of the real-data
+reconstruction, and finally became an *enforced guarantee* of the matching engine.
+ 
+---
+ 
+## What Phase-1 Demonstrates
+ 
+The portfolio value of this work is as much in the *engineering judgment* as in the numbers.
+The recurring narratives:
+ 
+- **Predictable latency over raw speed.** The whole project optimizes the *tail*, not the
+  mean — because in HFT a single multi-microsecond spike is a lost trade. The headline result
+  is the **28× worst-case reduction** (665 µs → 24 µs), not just the 3.9× mean.
+- **Measure, don't assume.** Every retained change is backed by a clean measurement, and the
+  experiments that *failed* are documented as first-class results: the hand-rolled hash table
+  that lost to `std::unordered_map`, and the cache-line alignment that measured neutral.
+  "Hand-rolled beats the standard library" is treated as a heuristic, not a law.
+- **The data corrected the hypothesis — repeatedly.** This is the strongest thread.
+  Intuition placed the bottleneck at the hash map; profiling showed the hash map is 0.06%.
+  Counters suggested a memory-bound feed; the flamegraph showed the stalls were file I/O.
+  The symbol filter — not the book — was the real software cost. Each time, measurement
+  overturned a plausible story, and the project followed the evidence.
+- **Correctness comes full circle.** The crossed-book invariant was written,
+  *deferred* with a documented reason (a storage book may be crossed — the test was invalid,
+  not the code), used to *validate* a real NASDAQ reconstruction, and finally
+  *enforced* by the matching engine. Knowing when an invariant applies is as important as
+  writing it.
+- **Knowing where software ends and the platform begins.** The residual 24 µs tail was
+  proven to be OS/hardware jitter (interrupts/SMI/first-touch), not algorithm — a conclusion
+  that points to core isolation as a deployment concern rather than forcing a hollow code
+  "fix."
+- **The engine is essentially free on a real feed.** On real NASDAQ data the order book is
+  ~1.6% of runtime; the dominant cost is feed I/O. This is exactly why production systems
+  push parsing into hardware — and it sets up Phase 3 (FPGA) as a logical next step.
+- **Correctness validated on real data.** The non-crossed invariant on a reconstructed AAPL
+  book, a realistic message-type histogram matching real market behavior, and end-to-end
+  pipeline tests together show the system is not just fast but *right*.
+- **Scope judgment.** The matcher implements the hard core (price-time priority, partial
+  fills, maker pricing) and *names* its omissions (IOC/FOK, self-trade prevention, icebergs,
+  the trade-vector allocation) instead of hiding them. The ladder's memory trade-off and the
+  cents-conversion are likewise documented limits, not surprises.
+- **Honest verification discipline.** Code is verified for correctness in a sandbox; every
+  performance number is measured on real hardware under controlled conditions.
+---
+ 
 ## Building & Running
-
+ 
 CMake targets (built into `build/`):
-
+ 
 ```bash
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
 ```
-
+ 
 | Target | Purpose |
 |---|---|
 | `orderbook_lib` | the core order book static library |
 | `test_orderbook` | unit + stress tests (GoogleTest) |
+| `test_matching` | matching-engine scenario tests (price-time priority, crossed-book invariant) |
 | `benchmark_orderbook` | RDTSC latency benchmark (`-O3 -march=native`) |
 | `profile_driver` | long-running steady-state workload for `perf` |
 | `itch_replay` | ITCH message-type histogram (parser validation) |
 | `itch_book_replay` | reconstruct one symbol's book from a real ITCH file |
-
+ 
 ```bash
 # tests
 ./test_orderbook
-
+./test_matching
+ 
 # latency benchmark (pin a core)
 taskset -c 3 ./benchmark_orderbook
-
+ 
 # reconstruct a symbol's book from real NASDAQ data
 ./itch_book_replay ~/market-data/sample_500mb.ITCH50 AAPL
-
+ 
 # batch report across files/symbols -> docs/
 ../run_itch_replays.sh -s AAPL,MSFT,SPY ~/market-data/*.NASDAQ_ITCH50
 ```
-
+ 
 Market data is the NASDAQ TotalView-ITCH 5.0 historical sample (binary, gzip-compressed).
 Data files are large (multi-GB) and are **not** committed to the repository.
-
+ 
 ---
+ 
+ 
