@@ -1,14 +1,6 @@
 #pragma once
 // spsc_ring.hpp - single-producer / single-consumer bounded lock-free ring buffer
-//
-//  - exactly ONE producer thread and ONE consumer thread (no CAS needed),
-//  - release/acquire pairing: producer writes slot then publishes head (release);
-//    consumer reads head (acquire) then reads slot -> slot write happens-before read,
-//  - head_ and tail_ on separate cache lines (alignas 64) to avoid false sharing,
-//  - cached indices so each side rarely touches the other's atomic line.
-//
-// Policy: try_push returns false when full (caller decides drop vs retry); the ring
-// itself never blocks or allocates.
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +8,7 @@
 
 namespace metrics {
 
-// Toggle the cache-line padding for the false-sharing A/B (compile with -DSPSC_NO_PAD
-// to pack head_ and tail_ onto the same line and measure the slowdown).
+// toggle the cache-line padding for the false-sharing A/B
 #ifdef SPSC_NO_PAD
 #  define SPSC_ALIGN
 #else
@@ -35,7 +26,7 @@ public:
     SPSCRing(const SPSCRing&) = delete;
     SPSCRing& operator=(const SPSCRing&) = delete;
 
-    // PRODUCER ONLY. Returns false if the ring is full (caller decides to drop or retry).
+    // PRODUCER ONLY - Returns false if the ring is full (caller decides to drop or retry).
     bool try_push(const T& v) {
         const std::size_t head = head_.load(std::memory_order_relaxed);  // only we write head_
         if (head - tail_cache_ >= Cap) {                 // cache asks if it's full
@@ -47,7 +38,7 @@ public:
         return true;
     }
 
-    // CONSUMER ONLY. Returns false if the ring is empty.
+    // CONSUMER ONLY - Returns false if the ring is empty.
     bool try_pop(T& out) {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);  // only we write tail_
         if (tail == head_cache_) {                       // cache says possibly empty?
@@ -59,7 +50,7 @@ public:
         return true;
     }
 
-    // Approximate size (racy by nature; for diagnostics only).
+    // Approximate size
     std::size_t size_approx() const {
         return head_.load(std::memory_order_acquire) - tail_.load(std::memory_order_acquire);
     }
