@@ -8,7 +8,7 @@ high-frequency trading, where a single multi-microsecond spike is a lost trade.
 Every performance claim in this document was measured on real hardware. Here's my setup :
 - OS/Kernel : Kali Linux
 - CPU Architecture : x86 (16 cores, profiling done on single pinned core)
-- IDE : vsCode
+- IDE : vsCode ( c++17, gcc 9+/Clang 10+ ).
 - Every test result is median-of-seven-runs.
 
 ---
@@ -635,6 +635,146 @@ The recurring narratives:
   performance number is measured on real hardware under controlled conditions.
 ---
  
+## Phase 2: Real-Time Monitoring
+
+Phase 2 instruments the Phase 1 engine and surfaces its behavior on a live dashboard. Phase 1 made `addOrder` cost 26.6 ns, so
+**instrumentation that adds 50 ns would destroy the very thing it measures.** The work is
+therefore not "draw charts" but *observability with a bounded, measured, near-zero cost on
+the hot path.* Three rules follow:
+
+1. The hot path never blocks, never allocates, never does I/O. Per operation it may only read
+   `rdtsc`, write one fixed-size record into a pre-allocated lock-free buffer, and continue.
+   If the buffer is full it **drops the sample and counts it** — losing a metric is
+   acceptable; stalling the engine is not.
+2. Only the hot thread touches the `OrderBook` (which is not thread-safe and gains no locks).
+   The metrics thread learns book state only from snapshot records the hot thread itself
+   pushes. Single-writer, no exceptions.
+3. All expensive work — percentile math, serialization, sockets — happens downstream on the
+   metrics thread, where microseconds are free.
+
+
+
+### The SPSC lock-free ring buffer
+
+The load-bearing primitive —  the *simplest correct* lock-free structure: a
+**single producer, single consumer** queue, which is what eliminates the hard parts (no CAS,
+no ABA problem, no retry loops — just two indices and memory ordering).
+
+- **Release/acquire pairing is the entire correctness argument.** The producer writes the
+  slot, then publishes `head` with `memory_order_release`; the consumer reads `head` with
+  `acquire`, then reads the slot. That pair guarantees the slot write happens-before the slot
+  read — articulating *why* `relaxed` would be wrong here is the interview question this
+  structure exists to answer.
+- **Padded indices.** `head` (producer-hammered) and `tail` (consumer-hammered) sit on
+  separate 64-byte cache lines so the two cores do not fight over one line.
+- **Cached indices.** Each side keeps a plain (non-atomic) copy of the other's index and only
+  re-reads the shared atomic when its cache says "full"/"empty" — cutting cross-core
+  cache-line traffic in steady state.
+- **Drop-on-full is a caller policy**, not the ring's: `try_push` returns `false` and the
+  caller decides. The hot thread drops; tests retry. The ring never blocks or allocates.
+  Records are a 32-byte `MetricsEvent` (two per cache line).
+
+**Verification was layered, because a hand-written lock-free structure demands it:**
+
+- A *torture test* runs 10 M items through a deliberately tiny ring (constant full/empty
+  churn) in two modes. No-loss mode (producer retries on full) asserts the consumer sees
+  *exactly* `0..N-1` in order — FIFO, no reorder, no duplication, no loss. Drop mode (producer
+  never waits) asserts the consumer sees a *strictly increasing* subsequence and that
+  `pushed == popped` with `pushed + dropped == N` — correct accounting under contention.
+- *ThreadSanitizer* reports **zero data races** across both modes — the verification that
+  matters for lock-free code, because TSAN reasons about the C++ memory model directly, so a
+  clean result is meaningful for weakly-ordered hardware (ARM), which a plain x86 run *cannot*
+  establish (x86's strong ordering hides missing-barrier bugs).
+- On real hardware (producer and consumer on separate cores) the ring streams millions of
+  items and demonstrates **buffer depth buys burst tolerance**: with the *same* producer and
+  consumer, a 1024-slot ring dropped ~2% of items while a 16-slot ring dropped ~74% — the
+  only variable was capacity. The drop *rate* is a property of buffer size and producer/
+  consumer speed mismatch; the *correctness* (`pushed == popped`, strict ordering) held
+  regardless.
+
+```
+// Torture test for SPSCRing: two threads, millions of items, small ring (forces full/empty
+// churn constantly). Two modes:
+//   Test 1 - NO LOSS (producer retries on full): consumer must see EXACTLY 0..N-1 in order.
+//            Proves FIFO + no reorder + no duplication + no loss.
+//   Test 2 - DROP ON FULL (producer never waits): consumer sees a STRICTLY INCREASING
+//            subsequence (gaps allowed) and pushed == popped, pushed + dropped == N.
+//            Proves no reorder/dup under heavy contention + correct accounting.
+// Plus a MetricsEvent round-trip to confirm the real element type works.
+```
+### Running SPSC Ring Test
+```bash
+# build:
+g++ -O2 -std=c++17 -pthread -Iinclude metrics/test_spsc.cpp -o ~/ultra-low-latency-orderbook/build/test_spsc
+
+# run:
+# pinning only one core (core-3)
+taskset -c 3 ./build/test_spsc
+
+# pinning two cores (core-3 & 4)
+taskset -c 3,4 ./build/test_spsc 
+```
+```
+--> Output when ran on core-3 only : 
+
+SPSC torture test (N=10000000)
+   [test2] N=10000000 pushed=2048 dropped=9997952 popped=2048 (100.0% dropped)
+   [test2] N=10000000 pushed=32 dropped=9999968 popped=32 (100.0% dropped)
+
+SPSC RING OK (FIFO, no reorder/dup/loss, accounting, event round-trip)
+
+
+--> Output when ran on core-3 and core-4 :
+
+SPSC torture test (N=10000000)
+   [test2] N=10000000 pushed=9816171 dropped=183829 popped=9816171 (1.8% dropped)
+   [test2] N=10000000 pushed=2552614 dropped=7447386 popped=2552614 (74.5% dropped)
+
+SPSC RING OK (FIFO, no reorder/dup/loss, accounting, event round-trip)
+
+```
+The honest claim: *race-free under ThreadSanitizer across millions of operations in both
+retry and drop modes*.
+
+### Zero-overhead instrumentation
+
+Per-operation latency is captured by a `ScopedLatency` RAII guard (constructor reads `rdtsc`,
+destructor reads it again and records the delta) feeding a `MetricsRecorder` that stamps a
+`MetricsEvent` and pushes it into the ring. Both sit behind a `METRICS_ENABLED` compile-time
+switch, and the defining property — **when metrics are compiled off, the instrumentation
+produces literally zero machine code** — is verified in the generated assembly:
+
+```
+metrics OFF — the instrumented function compiles to 3 instructions:
+    endbr64                  ; CFI landing pad (not instrumentation)
+    mov   %rsi,%rdi          ; move arg
+    jmp   do_work            ; tail-call straight into the real operation
+    => zero rdtsc, zero ring code, zero branches
+```
+
+With metrics on, the same function contains the full machinery: two `rdtsc` reads, the event
+written into the ring slot, the full/empty index check, and the drop path with its atomic
+increment. This is what makes the overhead A/B *honest*: the "off" build is provably the
+engine with no observer attached, not merely a predicted-false branch.
+
+Supporting details: a **sampling knob** (record 1-in-N latency events) to tame the firehose
+at full replay speed; a **drop counter** that is atomic but touched only on the rare
+full-ring path (the common path is allocation- and atomic-free); and `recordTrade`/
+`recordSnapshot` that read `rdtsc` internally so their call sites pass no timestamp (which
+would otherwise survive even when metrics are off). End-to-end, events flow through the ring
+with exact `consumed + drops == attempted` accounting.
+
+*Current state:* the lock-free ring and the instrumentation mechanism are built and verified.
+Wiring `ScopedLatency` into the live `OrderBook`/`BookReplay` operations (`addOrder`,
+`cancelOrder`, `submitLimit`) is the next integration step, followed by the **aggregator
+thread** that drains the ring and turns the event stream into log-bucket histograms,
+1-second windows, and percentiles — the component that makes the metrics *meaningful* before
+any web layer. The two starred A/B measurements (false-sharing padded-vs-unpadded, and
+instrumentation overhead on-vs-off) then close out Week 6.
+
+---
+
+
 ## Building & Running
  
 CMake targets (built into `build/`):
