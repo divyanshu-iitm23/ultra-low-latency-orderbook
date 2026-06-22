@@ -386,6 +386,80 @@ justifies in the order book itself. The synthetic benchmark gives the latency st
 book is ~1.6%; the cost is I/O plus a symbol filter that has been removed). Both are
 complete and evidence-backed.
 
+### Order Book's performance on Real ITCH feed
+```
+For a subset of data (~500 Mb)
+
+Method:
+
+./build/itch_book_replay ~/market-data/sample_500mb.ITCH50 AAPL 
+
+
+Output:
+
+=== ITCH replay: AAPL ===
+
+modeled messages parsed : 13838945
+
+adds=50364
+
+deletes=26200
+
+reduces=3660
+
+replaces=4948
+
+final book state for AAPL:
+live orders   : 21948
+
+bid levels    : 3597   ask levels: 1135
+
+best bid      : $287.53
+
+best ask      : $287.58
+
+spread        : $0.05
+
+crossed?      : no (good)
+```
+
+```
+For complete ITCH data (~8 Gb)
+
+Method:
+
+./build/itch_book_replay ~/market-data/12302019.NASDAQ_ITCH50 AAPL 
+
+
+Output:
+
+=== ITCH replay: AAPL ===
+
+modeled messages parsed : 263241937
+
+adds=698728
+
+deletes=654441
+
+reduces=62010
+
+replaces=96968
+
+final book state for AAPL:
+live orders   : 0
+
+bid levels    : 0
+
+ask levels: 0
+  (one side empty — symbol may be wrong, or slice too short to populate both sides)
+```
+
+*For **perf profiling outputs** of the two cases checkout these files:*
+- `/docs/profiling_NASDAQ_sample500MB.md` &
+- `/docs/profiling_real_NASDAQ.md`
+
+
+---
 ---
 
 ## Market Data Integration
@@ -483,6 +557,63 @@ Two honest notes on the data:
   correctly ends with **0 live orders** — every order is eventually filled, cancelled, or
   replaced by the close. This is the right end-of-day state, not a bug; inspecting an
   intraday snapshot requires a mid-session timestamp cutoff (planned).
+
+### A point to notice
+`itch_replay` and `itch_book_replay AAPL` parses the same number of messages --> `263241937 (~263 M)`, but their A/D/E/C/X.. differs.
+- itch_replay, counts every modeled message in the entire file, across all symbols:
+```
+A : 117,145,568      # all Adds, every stock on NASDAQ that day
+D : 114,360,997      # all Deletes, every stock
+...
+```
+- itch_book_replay AAPL, counts only the messages it actually applied to the AAPL book:
+```
+adds=698,728         # only AAPL Adds
+deletes=654,441      # only Deletes of orders that were in the AAPL book
+...
+```
+It's the symbol filter doing its job. AAPL is one symbol out of thousands, so it's responsible for ~699k of the 117M total adds (about 0.6%). The two tools agree perfectly on the thing they both count - modeled messages: 263,241,937 is identical in both runs, because both parsed the same full file. They diverge on the per-op counts because one is whole-market and the other is one-symbol-filtered.
+
+### Some other Filters apart from AAPL -> MSFT, SPY
+```
+Method:
+
+./build/itch_book_replay ~/market-data/12302019.NASDAQ_ITCH50 MSFT 
+
+Output:
+
+=== ITCH replay: MSFT ===
+file size            : 8251.4 MB
+load (mmap+prefault) : 21299 ms
+process (parse+book) : 7695 ms   (34.2 M msg/s)
+modeled messages     : 263241937
+  adds=576011 deletes=548843 reduces=36155 replaces=54873
+final book state for MSFT:
+  live orders   : 0
+  bid levels    : 0   ask levels: 0
+  (one side empty — wrong symbol, or full-day file drained to empty)
+
+```
+```
+Method:
+
+./build/itch_book_replay ~/market-data/12302019.NASDAQ_ITCH50 SPY 
+
+Output:
+
+=== ITCH replay: SPY ===
+file size            : 8251.4 MB
+load (mmap+prefault) : 22864 ms
+process (parse+book) : 7569 ms   (34.8 M msg/s)
+modeled messages     : 263241937
+  adds=991821 deletes=960491 reduces=62496 replaces=117317
+final book state for SPY:
+  live orders   : 0
+  bid levels    : 0   ask levels: 0
+  (one side empty — wrong symbol, or full-day file drained to empty)
+
+```
+
 
 ### Tooling
 
@@ -627,12 +758,9 @@ The recurring narratives:
 - **Correctness validated on real data.** The non-crossed invariant on a reconstructed AAPL
   book, a realistic message-type histogram matching real market behavior, and end-to-end
   pipeline tests together show the system is not just fast but *right*.
-- **Scope judgment.** The matcher implements the hard core (price-time priority, partial
+- **Matching Engine.** The matcher implements the hard core (price-time priority, partial
   fills, maker pricing) and *names* its omissions (IOC/FOK, self-trade prevention, icebergs,
-  the trade-vector allocation) instead of hiding them. The ladder's memory trade-off and the
-  cents-conversion are likewise documented limits, not surprises.
-- **Honest verification discipline.** Code is verified for correctness in a sandbox; every
-  performance number is measured on real hardware under controlled conditions.
+  the trade-vector allocation) instead of hiding them.
 ---
  
 ## Phase 2: Real-Time Monitoring
