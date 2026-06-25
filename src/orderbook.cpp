@@ -3,6 +3,7 @@
 namespace orderbook {
 
 OrderId OrderBook::addOrder(Side side, Price price, Quantity quantity, OrderId id) {
+    METRICS_SCOPE(metrics_, metrics::OpType::Add);
     if (!inRange(price)) return 0;
     int64_t idx = priceToIndex(price);
     Order* o = order_pool_.allocate(id, side, price, quantity);           // step1: construct an order in the pool (say chunk[0])
@@ -23,6 +24,7 @@ OrderId OrderBook::addOrder(Side side, Price price, Quantity quantity, OrderId i
 }
 
 bool OrderBook::cancelOrder(OrderId id) {
+    METRICS_SCOPE(metrics_, metrics::OpType::Cancel);
     auto it = orders_.find(id);
     if (it == orders_.end()) return false;
     Order* o = it->second;
@@ -79,6 +81,7 @@ Quantity OrderBook::executeMarketOrder(Side side, Quantity quantity) {
 }
 
 bool OrderBook::modifyOrder(OrderId id, Quantity new_quantity) {
+    METRICS_SCOPE(metrics_, metrics::OpType::Modify);
     auto it = orders_.find(id);
     if (it == orders_.end()) return false;
     Order* o = it->second;

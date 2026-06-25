@@ -51,16 +51,20 @@ PHASE 2: REAL-TIME MONITORING DASHBOARD (Ops)
 │
 ├── # Low-overhead metrics instrumentation
 |   |
-│   ├──  Instrument book (ops/sec, latency percentiles, depth, spread)
-│   ├──  Lock-free metrics collection (ring buffer / shared memory)
-│   ├──  Apply the false-sharing padding pattern HERE (writer vs reader thread)
-│   └──  Export mechanism
+│   ├──  [done] MetricsEvent (32-byte POD) + SPSC lock-free ring (padded, drop-on-full)
+│   ├──  [done] ScopedLatency + MetricsRecorder — zero machine code when compiled off
+│   ├──  [done] Aggregator thread — log-bucket histograms, p50/p99/p99.9/max, windows
+│   ├──  [done] Console "top"-style live readout (per-op percentiles + ops/sec)
+│   ├──  [done] Wired into the engine (add / cancel / modify), METRICS_ENABLED guard
+│   ├──  [done] Driven live from a real ITCH feed — paced replay (max / real-time / Nx)
+│   ├──  [todo] Overhead A/B — instrumented vs clean baseline (two builds ready)
+│   └──  [todo] False-sharing A/B — padded vs SPSC_NO_PAD, two-core throughput delta
 │
 └── # Real-time visualization
     |
-    ├──  Metrics-streaming backend
-    ├──  Dashboard (latency histograms, book depth, throughput)
-    └──  Alerting + historical playback
+    ├──  [todo] Snapshot serialization (JSON) + UDP publisher
+    ├──  [todo] UDP -> WebSocket bridge + browser dashboard (uPlot)
+    └──  [todo] Book-depth ladder, alerts, historical playback
 
 PHASE 3: FPGA UDP PACKET PARSER (Hardware)
 │
@@ -892,19 +896,86 @@ full-ring path (the common path is allocation- and atomic-free); and `recordTrad
 would otherwise survive even when metrics are off). End-to-end, events flow through the ring
 with exact `consumed + drops == attempted` accounting.
 
-*Current state:* the lock-free ring and the instrumentation mechanism are built and verified.
-Wiring `ScopedLatency` into the live `OrderBook`/`BookReplay` operations (`addOrder`,
-`cancelOrder`, `submitLimit`) is the next integration step, followed by the **aggregator
-thread** that drains the ring and turns the event stream into log-bucket histograms,
-1-second windows, and percentiles — the component that makes the metrics *meaningful* before
-any web layer. The two starred A/B measurements (false-sharing padded-vs-unpadded, and
-instrumentation overhead on-vs-off) then close out Week 6.
+### Wiring it into the engine
+
+The instrumentation only matters once it is measuring the real engine. `OrderBook` gained a
+single hook — `setMetrics(MetricsRecorder*)` — and `addOrder`, `cancelOrder`, and
+`modifyOrder` each open with a `METRICS_SCOPE(...)` guard that wraps the operation in a
+`ScopedLatency`. Two switches keep this honest:
+
+- **Compile-time** `METRICS_ENABLED` (a CMake `ENABLE_METRICS` option). When off,
+  `METRICS_SCOPE` expands to nothing and the recorder member is compiled out — the engine
+  builds exactly as before. That is what makes the overhead A/B a true instrumented-vs-clean
+  comparison: two build directories, `build-metrics` and `build-baseline`.
+- **Runtime** attach/detach. A build with metrics compiled in but no recorder attached
+  (`metrics_ == nullptr`) pays only a single predictable branch, so the existing tests and
+  benchmarks construct an `OrderBook` and are unaffected.
+
+Because the wiring lives in the engine rather than in each caller, anything that drives the
+book — synthetic churn or a real market feed — produces latency events for free.
+
+A deterministic test (`test_engine_wiring`, under CTest) pins the contract: a known sequence
+of mutators yields exactly one correctly-typed event each (including a *missed* cancel, which
+is still timed), every latency is non-zero, and detaching the recorder produces zero events.
+One caveat is recorded for later — the matcher's `submitLimit`/`submitMarket` reuse
+`addOrder`/`cancelOrder` internally, so timing Match/Market will first need the public timed
+entry separated from an untimed internal path to avoid double counting.
+
+### The aggregator thread and live console readout
+
+The producer side only stamps and pushes; the **aggregator thread** is where the event
+stream becomes meaning. It is the single consumer — it drains the ring in bursts and, owning
+its data structures outright, needs no locks. Each event folds into per-operation latency
+histograms using HDR-style log-linear bucketing (32 sub-buckets per power-of-two, ~3%
+relative error, ~900 buckets) that tracks exact min/max/sum alongside, so the worst-case tail
+is reported precisely rather than quantized. Two windows are kept per operation: a recent
+interval (reset each refresh, driving p50/p99/p99.9 and ops/sec) and a sticky cumulative one
+(the all-time max). Snapshot events feed a live book line (best bid/ask/spread); the drop
+counter is polled from the producer once per frame.
+
+On a wall-clock cadence (about 5 Hz) the same thread renders a `top`-style console readout —
+per-operation ops/sec, count, p50/p99/p99.9 and max, in real nanoseconds (the TSC tick-rate
+is calibrated once at startup) — repainting in place over ANSI on a terminal, or printing
+plain frames when piped. The pipeline is self-checking: `consumed + drops == produced` holds
+exactly at shutdown, after a final drain of the ring.
+
+### Driving it from a real ITCH feed
+
+The payoff of instrumenting at the engine level is that pointing the live monitor at a real
+NASDAQ feed needed no new engine or recorder code — only a small harness.
+`itch_metrics_replay` memory-maps an ITCH file, attaches a recorder to the book that
+`BookReplay` drives, spawns the aggregator on a second core, and parses on the hot thread, so
+every Add/Delete/Reduce/Replace is timed as it reconstructs the book and the percentiles
+update live.
+
+Two refinements make it a monitor rather than a batch run:
+
+- **Pacing.** `--pace=` replays by the messages' own ITCH nanosecond timestamps: `0` runs
+  flat-out (the latency-distribution view), `1` replays at real market speed, `10` at ten
+  times. Pacing inserts waits *between* operations, outside the timed region, so it never
+  pollutes the per-operation latency it reports.
+- **Load behavior.** Prefaulting a multi-gigabyte file into RAM (the profiling default) shows
+  nothing for several seconds while it loads; a loading indicator now makes that explicit, and
+  `--no-prefault` switches to lazy faulting so the live view appears immediately (at the cost
+  of one-time page-fault jitter in the earliest samples). Ctrl-C stops cleanly and still
+  prints the summary.
+
+*Current state:* the metrics pipeline is built, wired into the live engine, and driven
+end-to-end from both synthetic order flow and a real ITCH feed, with the aggregator turning
+raw events into live per-operation percentiles. What remains to close out the instrumentation
+week is the two A/B measurements — instrumentation overhead (the `build-metrics` vs
+`build-baseline` pair is already in place) and false-sharing (padded vs `SPSC_NO_PAD`). After
+that, Phase 2 moves to the transport and browser layers: serializing the aggregator's
+snapshots and streaming them over UDP and a WebSocket bridge to a dashboard — the same data
+this console view already shows.
 
 ---
 
 
 ## Building & Running
  
+### Phase 1: orderbook build and tests
+
 CMake targets (built into `build/`):
  
 ```bash
@@ -930,12 +1001,63 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 taskset -c 3 ./benchmark_orderbook
  
 # reconstruct a symbol's book from real NASDAQ data
-./itch_book_replay ~/market-data/sample_500mb.ITCH50 AAPL
+./itch_book_replay ~/market-data/*.NASDAQ_ITCH50 AAPL
  
 # batch report across files/symbols -> docs/
 ../run_itch_replays.sh -s AAPL,MSFT,SPY ~/market-data/*.NASDAQ_ITCH50
 ```
  
+### Phase 2: metrics build and tests
+
+The metrics instrumentation is gated by a CMake option, `ENABLE_METRICS` (default `ON`). The
+overhead A/B is just two build directories — instrumented and clean:
+
+```bash
+# instrumented build (engine times add / cancel / modify; all metrics targets built)
+cmake -S . -B build-metrics  -DENABLE_METRICS=ON  && cmake --build build-metrics  -j$(nproc)
+
+# clean baseline (instrumentation compiles to nothing; for the A/B and pristine perf)
+cmake -S . -B build-baseline -DENABLE_METRICS=OFF && cmake --build build-baseline -j$(nproc)
+```
+
+| Target | Purpose |
+|---|---|
+| `test_spsc` | SPSC ring torture test (FIFO, no loss/dup, drop accounting) |
+| `test_instrument` | recorder event-flow + `consumed + drops == attempted` accounting |
+| `test_engine_wiring` | one correctly-typed event per `add`/`cancel`/`modify`; detach silences |
+| `aggregator_demo` | synthetic producer + aggregator live "top" readout |
+| `engine_metrics_demo` | real `OrderBook` driven by synthetic churn, timed live |
+| `itch_metrics_replay` | real NASDAQ ITCH feed -> live per-op latency monitor |
+
+Running the tests:
+
+```bash
+# CTest runs the registered tests: the GoogleTest order-book suite + the engine-wiring test
+ctest --test-dir build-metrics --output-on-failure
+
+# the remaining test binaries are run directly
+./build-metrics/test_matching                  # matching scenarios + crossed-book invariant
+./build-metrics/test_instrument                # recorder event flow + accounting
+taskset -c 3,4 ./build-metrics/test_spsc       # SPSC ring torture on two cores (burst tolerance)
+```
+
+Running the live monitors (use a real terminal for the in-place "top" view):
+
+```bash
+# synthetic order flow through the real engine, 8 seconds
+./build-metrics/engine_metrics_demo 8
+
+# a real ITCH feed, paced at 10x, lazy load so the view appears immediately
+taskset -c 2,3 ./build-metrics/itch_metrics_replay ~/market-data/*.NASDAQ_ITCH50 AAPL --pace=1 --no-prefault
+# usage: itch_metrics_replay <itch_file> <SYMBOL> [options]
+#     --pace=<F>     replay speed by ITCH timestamps: 0=max (default),
+#                    1=real-time (1s replay == 1s of market), 10=10x, ...
+#     --snap=<N>     emit a book snapshot every N messages (default 8192)
+#     --no-prefault  lazy load: the live view appears instantly and pages fault in as
+#                    the parser reaches them (early samples carry one-time fault jitter),
+#                    instead of pre-faulting the whole file with MAP_POPULATE.
+```
+
 Market data is the NASDAQ TotalView-ITCH 5.0 historical sample (binary, gzip-compressed).
 Data files are large (multi-GB) and are **not** committed to the repository.
  

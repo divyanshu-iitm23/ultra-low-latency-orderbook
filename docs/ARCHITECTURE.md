@@ -4,8 +4,6 @@
 ### Phase-2 ---> **Real Time Monitoring Dashboard** *(Operations)*
 ### Phase-3 ---> **FPGA UDP Packet Parser** *(Hardware/Simulations)*
 
-> Legend:  `═` built & tested   ·   `┄` planned (not yet built)
-
 ---
 
 ## PHASE 1 — Order Book Engine
@@ -29,18 +27,18 @@
    │                │  │   PriceLevel>  │  │ vector<u64>    │  │ <OrderId,      │
    │ intrusive free │  │                │  │                │  │  Order*>       │
    │ list · O(1)    │  │ idx = price    │  │ 1 bit / level  │  │                │
-   │ no hot malloc  │  │     - min_price│  │ clz/ctz scan → │  │ O(1) lookup    │
-   │                │  │ O(1) price→lvl │  │ best bid / ask │  │ for cancel/mod │
+   │ no hot malloc  │  │     - min_price│  │ clz/ctz scan-> │  │ O(1) lookup    │
+   │                │  │O(1) price->lvl │  │ best bid / ask │  │ for cancel/mod │
    └────────────────┘  └────────────────┘  └────────────────┘  └────────────────┘
          │                     │                    │
      Order* (64B)        bid_levels_[i]        best_bid_idx_
      handed out          ask_levels_[i]        best_ask_idx_
 ```
 
-Hot-path steps — **add:** (1) pull an `Order` slot from the pool → (2) append it to
-the `PriceLevel` at `idx=price-min_price` → (3) set that level's occupancy bit →
-(4) record `id→Order*`. **cancel/modify:** map lookup → unlink from the level →
-if the level emptied, clear its bit and bit-scan a new best → return the slot to the pool.
+Hot-path steps — **add:** (1) pull an `Order` slot from the pool -> (2) append it to
+the `PriceLevel` at `idx=price-min_price` -> (3) set that level's occupancy bit ->
+(4) record `id->Order*`. **cancel/modify:** map lookup -> unlink from the level ->
+if the level emptied, clear its bit and bit-scan a new best -> return the slot to the pool.
 
 ### 1B · In-memory layout (the structures, related)
 
@@ -56,8 +54,8 @@ if the level emptied, clear its bit and bit-scan a new best → return the slot 
   PRICE LADDER (direct-mapped)            OCCUPANCY BITMAP (parallel to ladder)
   idx:  …  9947   9948   9949  …          word: …01000100…  ← 1 bit per level
         ┌──────┬──────┬──────┐                  └──┬────┘
-        │ PL   │ PL   │ PL   │   ask_levels_       clz → lowest set = best ask
-        └──────┴───┬──┴──────┘                     ctz → highest set = best bid
+        │ PL   │ PL   │ PL   │   ask_levels_       clz -> lowest set = best ask
+        └──────┴───┬──┴──────┘                     ctz -> highest set = best bid
                    │ PriceLevel @ price
                    ▼
         head_ ─► Order ─► Order ─► Order ◄─ tail_     intrusive doubly-linked
@@ -69,12 +67,12 @@ if the level emptied, clear its bit and bit-scan a new best → return the slot 
              (cancel/modify entry point)       └──► the same Order objects above
 ```
 
-### 1C · Header / source dependency graph (`A → B` = *A includes B*)
+### 1C · Header / source dependency graph (`A -> B` = *A includes B*)
 
 ```
                          ┌────────────────────────────┐
                          │  src/orderbook.cpp         │  ← the compiled TU
-                         │  (impl: add/cancel/modify/ │     → orderbook_lib
+                         │  (impl: add/cancel/modify/ │     -> orderbook_lib
                          │   match/submitLimit/Market)│
                          └──────────────┬─────────────┘
                                         ▼
@@ -98,14 +96,14 @@ if the level emptied, clear its bit and bit-scan a new best → return the slot 
 
    Standalone (not in the include tree above):
      rdtsc_timer.hpp   calibrated TscClock + RDTSC harness  (used by benchmarks)
-     itch_parser.hpp / book_replay.hpp   NASDAQ ITCH-5.0 feed → book ops
+     itch_parser.hpp / book_replay.hpp   NASDAQ ITCH-5.0 feed -> book ops
 ```
 
 ---
 
 ## PHASE 2 — Real-Time Monitoring Dashboard
 
-### 2A · Runtime: hot thread → ring → metrics thread → transport
+### 2A · Runtime: hot thread -> ring -> metrics thread -> transport
 
 ```
         CORE A  — latency-critical hot path        │   CORE B — analysis (may be slow)
@@ -123,7 +121,7 @@ if the level emptied, clear its bit and bit-scan a new best → return the slot 
               ┌──────────────────┐                 │   │   drops (polled) ◄─────────┼──┐  │
               │ MetricsRecorder  │ record{Latency, │   │     │                      │  │  │
               │                  │ Snapshot, Trade}│   │     ▼                      │  │  │
-              │ build Metrics    │ → 32-byte POD   │   │  render @≈5Hz →            │  │  │
+              │ build Metrics    │ -> 32-byte POD  │   │  render @≈5Hz ->           │  │  │
               │ Event (32B)      │                 │   │   console "top" view ──────┘  │  │
               └────────┬─────────┘                 │   │   (p50/p99/p99.9/max · ops/s) │  │
                        │ try_push                  │   └───────────────┬───────────────┘  │
@@ -134,8 +132,8 @@ if the level emptied, clear its bit and bit-scan a new best → return the slot 
         ║  lock-free · release/acquire  ║   try_pop              └──────────┬──────────┘
         ║  padded · cached indices      ║                                  ▼  [planned]
         ╚═══════════════════════════════╝                         ┌---------------------┐
-                       ▲                                          | UDP→WebSocket bridge|
-              full? → drops_++ (atomic, never blocks)             |       (Python)      |
+                       ▲                                          |UDP->WebSocket bridge|
+              full? -> drops_++ (atomic, never blocks)            |       (Python)      |
                        │ dropsCounter()  ────────────────────────►|          │          |
                        (read live by the aggregator)              └----------|----------┘
                                                                              ▼  [planned]
@@ -153,7 +151,7 @@ boundary; everything expensive (histograms, percentiles, rendering, transport) l
 on Core B where it can never throttle the engine. Drop-on-full is the release valve —
 `consumed + drops == produced` always holds.
 
-### 2B · Header / source dependency graph (`A → B` = *A includes B*)
+### 2B · Header / source dependency graph (`A -> B` = *A includes B*)
 
 ```
    metrics/aggregator_demo.cpp        test_instrument.cpp      test_spsc.cpp
@@ -184,12 +182,92 @@ on Core B where it can never throttle the engine. Drop-on-full is the release va
 
 ```
    Module map (metrics/):
-     tsc.hpp                cheap rdtsc() read
-     metrics_event.hpp      32-byte POD event (Latency / Snapshot / Trade)
-     spsc_ring.hpp          SPSC lock-free ring (SPSC_NO_PAD toggles padding)
-     metrics_config.hpp     wires ring + event → EventRing, sets depth
-     metrics_recorder.hpp   hot-path producer: ScopedLatency + MetricsRecorder
-     latency_histogram.hpp  log-linear percentile histogram (consumer side)
-     aggregator.hpp         consumer thread: drain → histograms → "top" readout
+      include/
+        |- tsc.hpp                cheap rdtsc() read
+        |- metrics_event.hpp      32-byte POD event (Latency / Snapshot / Trade)
+        |- spsc_ring.hpp          SPSC lock-free ring (SPSC_NO_PAD toggles padding)
+        |- metrics_config.hpp     wires ring + event -> EventRing, sets depth
+        |- metrics_recorder.hpp   hot-path producer: ScopedLatency + MetricsRecorder
+        |- latency_histogram.hpp  log-linear percentile histogram (consumer side)
+        |- aggregator.hpp         consumer thread: drain -> histograms -> "top" readout
      aggregator_demo.cpp    end-to-end demo (synthetic producer + aggregator)
+     engine_metrics_demo.cpp  real OrderBook + synthetic churn, timed live
+     itch_metrics_replay.cpp  real NASDAQ ITCH feed -> BookReplay -> live readout (paced)
+     test_engine_wiring.cpp   deterministic: one typed event per add/cancel/modify
+     test_instrument.cpp
+     test_spsc.cpp
 ```
+
+Note: the engine now depends on the metrics headers — `orderbook.hpp` includes
+`metrics_recorder.hpp`, so `ScopedLatency` / `METRICS_SCOPE` are visible inside
+`src/orderbook.cpp`. With `METRICS_ENABLED=0` that include resolves to empty stubs.
+
+### 2C · Wiring metrics into the engine
+
+```
+  BUILD SWITCH   ENABLE_METRICS (CMake option)  ->  METRICS_ENABLED -> {0,1}
+    ON   build-metrics/    instrumentation compiled into the engine
+    OFF  build-baseline/   METRICS_SCOPE -> nothing, recorder member #if'd out
+                           (the clean control; overhead A/B = these two builds)
+
+  INCLUDE        orderbook.hpp -> metrics_recorder.hpp   (ScopedLatency, METRICS_SCOPE)
+
+  RUNTIME HOOK   OrderBook::setMetrics(MetricsRecorder*)   attach / detach (null = off)
+
+     addOrder    ┐
+     cancelOrder ├─ each body opens with  METRICS_SCOPE(metrics_, OpType::…)
+     modifyOrder ┘        │
+                          ├─ metrics_ == nullptr -> one predictable branch, no record
+                          └─ metrics_ != nullptr -> ScopedLatency times the body
+                                                    -> recordLatency -> ring.try_push
+```
+
+Instrumenting at the engine (not each caller) is what lets *any* driver — synthetic churn,
+`engine_metrics_demo`, or a real ITCH feed — be timed for free. `match` / `executeMarketOrder`
+are intentionally **not** wired yet: they reuse `cancelOrder` / `addOrder` internally, so
+timing them now would double-count (the public timed entry must first be split from an
+untimed internal path).
+
+### 2D · Live replay from a real ITCH feed (`itch_metrics_replay`)
+
+The payoff of engine-level wiring: pointing the live monitor at a real NASDAQ feed needs no
+new engine or recorder code — only a producer that parses ITCH and drives `BookReplay`.
+
+```
+ $ itch_metrics_replay  file.NASDAQ_ITCH50  AAPL  [--pace=N] [--no-prefault] [--snap=N]
+
+ SETUP (main thread)
+   open + fstat -> mmap (MAP_POPULATE unless --no-prefault)
+       prefault: touch every 4 KB page (whole file -> RAM; this is the startup wait)
+       lazy:     pages fault in during the parse (live view appears at once)
+   TscClock calibrate -> ns_per_tick
+   EventRing · MetricsRecorder rec · OrderBook book · book.setMetrics(&rec)
+   BookReplay rp(book,"AAPL") · Aggregator agg(ring, rec.dropsCounter(), ns_per_tick)
+                 │
+        std::thread consumer([]{ agg.run(); })  --- fork --->  CORE B
+                 │  (main thread = producer on CORE A)
+ STEADY STATE
+   itch::parseBuffer(data, size, lambda):                  CORE B  agg.run():
+     lambda(msg):                                             try_pop (burst drain)
+       --pace>0 ? pace_to(wall0 + (msg.ts−itch0)/pace)   ingest -> histograms · book · drops
+       rp.onMessage(msg):                                render "top" @ ~5 Hz
+         A/F->addOrder  D->cancel  X/E/C->modify|cancel  U->cancel+add
+            └─ TARGET SYMBOL ONLY -> ScopedLatency -> ring.try_push -->  (drained by B)
+       every --snap msgs -> recordSnapshot(bestBid, bestAsk)
+                 │
+ SHUTDOWN (end of file, or Ctrl-C -> g_stop)
+   final recordSnapshot -> agg.stop() -> consumer.join() (final drain + last frame)
+   summary: messages · adds/deletes/reduces/replaces · consumed / drops · final book
+```
+
+Two properties worth noting:
+
+- **Pacing is outside the timed region.** `--pace` (0 = max, 1 = real-time, N = N×) inserts
+  waits *between* operations via `pace_to`, so it never enters a `ScopedLatency` scope — the
+  per-op latencies are identical regardless of replay speed; only the spacing changes.
+- **Drops are rate-driven, not size-driven.** The single-symbol filter means the vast
+  majority of even a multi-GB file produces *no* events (non-target messages return before
+  touching the instrumented engine). Producing one event also costs more than draining it, so
+  the consumer keeps up and the 64K ring absorbs bursts -> typically `drops = 0`. Forcing drops
+  means outpacing the consumer: shrink the ring, pick a hot symbol at `--pace=0`, or share one
+  core.

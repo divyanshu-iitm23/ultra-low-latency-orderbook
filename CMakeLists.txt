@@ -12,6 +12,17 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 
 # Include directories
 include_directories(include)
+include_directories(metrics/include)
+
+# Phase-2 metrics instrumentation switch
+# ON  : ScopedLatency is compiled into the engine (add/cancel/modify timed).
+# OFF : METRICS_ENABLED=0 : instrumentation compiles to nothing (clean baseline).
+option(ENABLE_METRICS "Compile in latency metrics instrumentation" ON)
+if(ENABLE_METRICS)
+    add_compile_definitions(METRICS_ENABLED=1)
+else()
+    add_compile_definitions(METRICS_ENABLED=0)
+endif()
 
 # Source files
 set(SOURCES
@@ -52,3 +63,34 @@ target_compile_options(itch_book_replay PRIVATE -O3 -march=native)
 # Matching Engine testing..
 add_executable(test_matching test_matching.cpp)
 target_link_libraries(test_matching orderbook_lib)
+
+# Phase-2 metrics pipeline
+# SPSC ring torture test is independent of the METRICS_ENABLED switch.
+add_executable(test_spsc metrics/test_spsc.cpp)
+target_link_libraries(test_spsc pthread)
+
+if(ENABLE_METRICS)
+    # event-flow / accounting check for the recorder + ring
+    add_executable(test_instrument metrics/test_instrument.cpp)
+    target_link_libraries(test_instrument pthread)
+
+    # deterministic test that the engine wiring fires one typed event per op
+    add_executable(test_engine_wiring metrics/test_engine_wiring.cpp)
+    target_link_libraries(test_engine_wiring orderbook_lib pthread)
+    add_test(NAME EngineWiring COMMAND test_engine_wiring)
+
+    # synthetic producer + aggregator live readout
+    add_executable(aggregator_demo metrics/aggregator_demo.cpp)
+    target_link_libraries(aggregator_demo pthread)
+    target_compile_options(aggregator_demo PRIVATE -O3 -march=native)
+
+    # the real wiring: metrics-instrumented OrderBook driven live (synthetic churn)
+    add_executable(engine_metrics_demo metrics/engine_metrics_demo.cpp)
+    target_link_libraries(engine_metrics_demo orderbook_lib pthread)
+    target_compile_options(engine_metrics_demo PRIVATE -O3 -march=native)
+
+    # same, but the producer is a REAL NASDAQ ITCH feed via BookReplay
+    add_executable(itch_metrics_replay metrics/itch_metrics_replay.cpp)
+    target_link_libraries(itch_metrics_replay orderbook_lib pthread)
+    target_compile_options(itch_metrics_replay PRIVATE -O3 -march=native)
+endif()

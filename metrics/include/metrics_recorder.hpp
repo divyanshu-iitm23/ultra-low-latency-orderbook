@@ -53,8 +53,10 @@ private:
 class ScopedLatency {
 public:
     ScopedLatency(MetricsRecorder& r, OpType op) : r_(&r), op_(op), t0_(rdtsc()) {}
-    // destructor reads Latency metric..
-    ~ScopedLatency() { uint64_t t1 = rdtsc(); r_->recordLatency(op_, uint32_t(t1 - t0_), t1); }
+    // constructor calling rdtsc()..
+    ScopedLatency(MetricsRecorder* r, OpType op) : r_(r), op_(op), t0_(r ? rdtsc() : 0) {}
+    // destructor calling rstsc() and reads Latency metric..
+    ~ScopedLatency() { if (r_) { uint64_t t1 = rdtsc(); r_->recordLatency(op_, uint32_t(t1 - t0_), t1); } }
     ScopedLatency(const ScopedLatency&) = delete;
     ScopedLatency& operator=(const ScopedLatency&) = delete;
 private:
@@ -78,3 +80,10 @@ struct ScopedLatency { inline ScopedLatency(MetricsRecorder&, OpType) {} };
 #endif
 
 } // namespace metrics
+
+// METRICS_SCOPE(recorder_ptr, op)
+#if METRICS_ENABLED
+#  define METRICS_SCOPE(rec_ptr, op) ::metrics::ScopedLatency _metrics_scope_((rec_ptr), (op))
+#else
+#  define METRICS_SCOPE(rec_ptr, op) ((void)0)
+#endif

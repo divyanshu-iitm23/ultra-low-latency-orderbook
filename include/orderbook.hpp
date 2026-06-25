@@ -1,6 +1,7 @@
 #pragma once
 #include "price_level.hpp"
 #include "object_pool.hpp"
+#include "metrics_recorder.hpp"   // ScopedLatency + METRICS_SCOPE (no-op when METRICS_ENABLED=0)
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
@@ -72,6 +73,11 @@ public:
     size_t getActiveBids() const { return bid_count_; }
     size_t getActiveAsks() const { return ask_count_; }
 
+#if METRICS_ENABLED
+    // Attach a recorder to time add/cancel/modify. Null (the default) records nothing.
+    void setMetrics(metrics::MetricsRecorder* m) { metrics_ = m; }
+#endif
+
     void printBook(int depth = 5) const;
 
 private:
@@ -106,5 +112,8 @@ private:
     std::unordered_map<OrderId, Order*> orders_;
     OrderId next_order_id_; size_t total_orders_;
     ObjectPool<Order> order_pool_;
+#if METRICS_ENABLED
+    metrics::MetricsRecorder* metrics_ = nullptr;   // attached via setMetrics(); null = off
+#endif
 };
 }

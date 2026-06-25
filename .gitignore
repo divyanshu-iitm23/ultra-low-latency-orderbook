@@ -3,6 +3,8 @@ cat > .gitignore << 'EOF'
 build/
 out/
 cmake-build-*/
+build-baseline/
+build-metrics/
 
 # CMake artifacts
 CMakeCache.txt
