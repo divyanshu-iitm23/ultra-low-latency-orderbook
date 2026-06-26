@@ -30,6 +30,9 @@ Makefile
 # Debug/profile output
 *.log
 perf.data*
+perf.data.old*
+itch_perf.data*
+itch_perf2.data*
 
 # Data files
 data/*.itch

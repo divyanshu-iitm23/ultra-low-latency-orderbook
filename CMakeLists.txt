@@ -69,6 +69,20 @@ target_link_libraries(test_matching orderbook_lib)
 add_executable(test_spsc metrics/test_spsc.cpp)
 target_link_libraries(test_spsc pthread)
 
+# Overhead A/B benchmark: built in BOTH configs (it is #if-guarded internally), so it
+add_executable(benchmark_overhead metrics/benchmark_overhead.cpp)
+target_link_libraries(benchmark_overhead orderbook_lib pthread)
+target_compile_options(benchmark_overhead PRIVATE -O3 -march=native)
+
+# False-sharing A/B: one source, built twice - padded vs unpadded SPSC ring.
+add_executable(bench_false_sharing_padded metrics/benchmark_false_sharing.cpp)
+target_link_libraries(bench_false_sharing_padded pthread)
+target_compile_options(bench_false_sharing_padded PRIVATE -O3 -march=native)
+
+add_executable(bench_false_sharing_nopad metrics/benchmark_false_sharing.cpp)
+target_link_libraries(bench_false_sharing_nopad pthread)
+target_compile_options(bench_false_sharing_nopad PRIVATE -O3 -march=native -DSPSC_NO_PAD)
+
 if(ENABLE_METRICS)
     # event-flow / accounting check for the recorder + ring
     add_executable(test_instrument metrics/test_instrument.cpp)
