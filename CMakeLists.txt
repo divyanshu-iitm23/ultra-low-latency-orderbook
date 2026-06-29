@@ -107,4 +107,14 @@ if(ENABLE_METRICS)
     add_executable(itch_metrics_replay metrics/itch_metrics_replay.cpp)
     target_link_libraries(itch_metrics_replay orderbook_lib pthread)
     target_compile_options(itch_metrics_replay PRIVATE -O3 -march=native)
+
+    # aggregator snapshot serialized as NDJSON (the dashboard data source)
+    add_executable(json_snapshot_demo metrics/json_snapshot_demo.cpp)
+    target_link_libraries(json_snapshot_demo orderbook_lib pthread)
+    target_compile_options(json_snapshot_demo PRIVATE -O3 -march=native)
+
+    # publish each snapshot as one JSON UDP datagram
+    add_executable(udp_publish_demo metrics/udp_publish_demo.cpp)
+    target_link_libraries(udp_publish_demo orderbook_lib pthread)
+    target_compile_options(udp_publish_demo PRIVATE -O3 -march=native)
 endif()

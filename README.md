@@ -62,7 +62,8 @@ PHASE 2: REAL-TIME MONITORING DASHBOARD (Ops)
 │
 └── # Real-time visualization
     |
-    ├──  [todo] Snapshot serialization (JSON) + UDP publisher
+    ├──  [done] Snapshot serialization (JSON) — aggregator sink, NDJSON, off hot path
+    ├──  [done] UDP snapshot publisher (C++) — fire-and-forget, one snapshot per datagram
     ├──  [todo] UDP -> WebSocket bridge + browser dashboard (uPlot)
     └──  [todo] Book-depth ladder, alerts, historical playback
 
@@ -1070,12 +1071,57 @@ producer also does ~50 ns of real engine work between pushes, so the ring is not
 penalty is diluted — but the A/B's job is to isolate the padding's value, and it does: a free `alignas`
 removes a 2.4× cliff.
 
-*Current state:* Week 6 is complete. The metrics pipeline is built, wired into the live engine, driven
-end-to-end from both synthetic order flow and a real ITCH feed, and both A/B measurements are done — the
-instrumentation overhead (+1.5 ns detached, +41 ns attached) and the false-sharing payoff (2.4× ring
-throughput from padding, across physical cores). Phase 2 now moves to the transport and browser layers:
-serializing the aggregator's snapshots and streaming them over UDP and a WebSocket bridge to a dashboard
-— the same data this console view already shows.
+## Transport and the dashboard data source
+
+### Snapshot serialization
+
+This part turns the monitor outward: the same per-operation percentiles, throughput, and book state the
+console already shows have to leave the process and reach a browser. The first step is a serialization
+format, and the previous rule still holds — nothing on the hot path. The hot thread never touches any of
+this; serialization happens on the aggregator (Core B) at the render cadence (~5 Hz), where microseconds
+are free, so plain `snprintf` JSON is entirely appropriate.
+
+The aggregator already computes a full per-cycle view to paint the console; that computation now lands in
+a single `MetricsSnapshot` struct (header counters, the book line, and a per-op row of
+`ops/s · count · p50 · p99 · p99.9 · max` in nanoseconds). One `render()` cycle builds the snapshot once
+and fans it out two ways: to the console "top" view (unchanged, byte-for-byte) and to an optional **sink**
+— `setSnapshotSink(std::function<void(const MetricsSnapshot&)>)` — the seam every downstream consumer
+attaches to. `writeJson()` serializes a snapshot to a compact single-line JSON object, sized to fit one
+UDP datagram (~600–800 bytes with five op rows):
+
+```json
+{"t":3.0,"final":true,"events":19920317,"drops":0,"unit":"ns",
+ "book":{"bid":99999,"ask":100001,"spread":2,"last":0,"vol":0},
+ "ops":[{"op":"add","ops_s":1517909,"count":8433067,"p50":20.3,"p99":115.7,"p999":144.0,"max":28310.8},
+        {"op":"cancel","ops_s":1523500,"count":8400300,"p50":123.5,"p99":216.0,"p999":257.2,"max":127168.2}]}
+```
+
+`json_snapshot_demo` drives the real engine and registers a sink that writes one such line per cycle
+(NDJSON) to stdout — the exact stream the UDP publisher will send. Verification is direct: run it and
+parse every line. A three-second run produces ~16 snapshots at 5 Hz, all valid JSON, with the console
+view confirmed unchanged — the snapshot is built from the same numbers, so the two can never drift.
+
+### UDP snapshot publisher
+
+With a serialization format in hand, the next link sends it off-box. The transport is plain
+fire-and-forget **UDP**. The publisher never blocks, never
+retries, and a lost datagram just means the dashboard skips one frame. `UdpPublisher` opens a datagram
+socket once and, each render cycle, serializes the snapshot with `writeJson()` and `sendto()`s it as a
+single datagram (one snapshot fits comfortably under an MTU, so there is no framing to reassemble). It
+lives where the snapshot does — the aggregator thread (Core B), ~5 Hz, off the hot path — so a blocking
+`sendto` is fine.
+
+The publisher is just another sink:
+`agg.setSnapshotSink([&pub](const MetricsSnapshot& s){ pub.send(s); })`. `udp_publish_demo` wires it to
+the real engine and aims datagrams at `127.0.0.1:9099`. End-to-end verification used a throwaway UDP
+receiver: a three-second run sent **16 datagrams, 0 errors**, and the receiver got all **16, every one
+valid JSON** — the same payload the console shows, now on the wire.
+
+*Current state:* the C++ side of the transport chain is complete —
+engine → aggregator → `MetricsSnapshot` → `writeJson()` → UDP datagrams. What remains is the
+browser-facing half: a small Python UDP→WebSocket bridge (browsers cannot read UDP directly) and a
+single-file uPlot dashboard. Once both exist, `udp_publish_demo` — or the paced ITCH replay — can drive a
+live browser dashboard straight from real NASDAQ data.
 
 ---
 
@@ -1138,6 +1184,8 @@ cmake -S . -B build-baseline -DENABLE_METRICS=OFF && cmake --build build-baselin
 | `itch_metrics_replay` | real NASDAQ ITCH feed -> live per-op latency monitor |
 | `benchmark_overhead` | instrumentation overhead A/B (built in **both** configs) |
 | `bench_false_sharing_padded` / `_nopad` | SPSC false-sharing A/B (padded vs `-DSPSC_NO_PAD`) |
+| `json_snapshot_demo` | aggregator snapshot as NDJSON (Week-7 dashboard data source) |
+| `udp_publish_demo` | publish each snapshot as one JSON UDP datagram (Week-7 transport) |
 
 Running the tests:
 
@@ -1244,6 +1292,25 @@ median throughput: 11.6 M items/s   [NO-PAD  (head_/tail_/buf_ packed -> false s
 ```
 
 
+
+Emitting the metrics snapshot as NDJSON (the dashboard data source; validate by parsing each line):
+
+```bash
+./build-metrics/json_snapshot_demo 3 > /tmp/snap.ndjson            # one JSON object per render cycle
+python3 -c "import json;[json.loads(l) for l in open('/tmp/snap.ndjson')];print('valid NDJSON')"
+tail -1 /tmp/snap.ndjson | python3 -m json.tool                    # eyeball one snapshot
+```
+
+Publishing snapshots over UDP (one JSON datagram per render cycle). Start a receiver first, since
+datagrams to a port with no listener are silently dropped:
+
+```bash
+# terminal 1 - a throwaway receiver (netcat, or the Python bridge once it exists)
+nc -u -l 9099
+
+# terminal 2 - publish to it
+./build-metrics/udp_publish_demo 8 127.0.0.1 9099
+```
 
 Running the live monitors (use a real terminal for the in-place "top" view):
 

@@ -125,18 +125,18 @@ if the level emptied, clear its bit and bit-scan a new best -> return the slot t
               │ Event (32B)      │                 │   │   console "top" view ──────┘  │  │
               └────────┬─────────┘                 │   │   (p50/p99/p99.9/max · ops/s) │  │
                        │ try_push                  │   └───────────────┬───────────────┘  │
-                       ▼                           │                   ┊ snapshot (JSON ~10Hz)
-        ╔═══════════════════════════════╗          │                   ▼          [planned]
+                       ▼                           │                   ┊ snapshot (JSON ~5Hz)
+        ╔═══════════════════════════════╗          │                   ▼          
         ║  EventRing = SPSCRing<        ║          │             ┌---------------------┐
         ║   MetricsEvent, 64K>          ║◄─────────┘             | UDP publisher (C++) |
         ║  lock-free · release/acquire  ║   try_pop              └──────────┬──────────┘
-        ║  padded · cached indices      ║                                  ▼  [planned]
+        ║  padded · cached indices      ║                                  ▼  
         ╚═══════════════════════════════╝                         ┌---------------------┐
                        ▲                                          |UDP->WebSocket bridge|
               full? -> drops_++ (atomic, never blocks)            |       (Python)      |
                        │ dropsCounter()  ────────────────────────►|          │          |
                        (read live by the aggregator)              └----------|----------┘
-                                                                             ▼  [planned]
+                                                                             ▼  
                                                                   ┌---------------------┐
                                                                   | Browser dashboard   |
                                                                   | (uPlot, percentiles |
@@ -190,9 +190,13 @@ on Core B where it can never throttle the engine. Drop-on-full is the release va
         |- metrics_recorder.hpp   hot-path producer: ScopedLatency + MetricsRecorder
         |- latency_histogram.hpp  log-linear percentile histogram (consumer side)
         |- aggregator.hpp         consumer thread: drain -> histograms -> "top" readout
+        |- metrics_snapshot.hpp   MetricsSnapshot + writeJson() (consumer-side, ~5 Hz)
+        |- udp_publisher.hpp      UdpPublisher: one snapshot -> one JSON UDP datagram
      aggregator_demo.cpp    end-to-end demo (synthetic producer + aggregator)
      engine_metrics_demo.cpp  real OrderBook + synthetic churn, timed live
      itch_metrics_replay.cpp  real NASDAQ ITCH feed -> BookReplay -> live readout (paced)
+     json_snapshot_demo.cpp   aggregator snapshot -> NDJSON on stdout
+     udp_publish_demo.cpp     aggregator snapshot -> JSON UDP datagrams
      test_engine_wiring.cpp   deterministic: one typed event per add/cancel/modify
      test_instrument.cpp
      test_spsc.cpp
@@ -237,16 +241,22 @@ new engine or recorder code — only a producer that parses ITCH and drives `Boo
  $ itch_metrics_replay  file.NASDAQ_ITCH50  AAPL  [--pace=N] [--no-prefault] [--snap=N]
 
  SETUP (main thread)
+
    open + fstat -> mmap (MAP_POPULATE unless --no-prefault)
        prefault: touch every 4 KB page (whole file -> RAM; this is the startup wait)
        lazy:     pages fault in during the parse (live view appears at once)
+
    TscClock calibrate -> ns_per_tick
    EventRing · MetricsRecorder rec · OrderBook book · book.setMetrics(&rec)
    BookReplay rp(book,"AAPL") · Aggregator agg(ring, rec.dropsCounter(), ns_per_tick)
                  │
-        std::thread consumer([]{ agg.run(); })  --- fork --->  CORE B
+                 |
+        std::thread consumer([]{ agg.run(); })  ------>  CORE B
+                 |
                  │  (main thread = producer on CORE A)
+                 |
  STEADY STATE
+
    itch::parseBuffer(data, size, lambda):                  CORE B  agg.run():
      lambda(msg):                                             try_pop (burst drain)
        --pace>0 ? pace_to(wall0 + (msg.ts−itch0)/pace)   ingest -> histograms · book · drops
@@ -255,6 +265,7 @@ new engine or recorder code — only a producer that parses ITCH and drives `Boo
             └─ TARGET SYMBOL ONLY -> ScopedLatency -> ring.try_push -->  (drained by B)
        every --snap msgs -> recordSnapshot(bestBid, bestAsk)
                  │
+                 |
  SHUTDOWN (end of file, or Ctrl-C -> g_stop)
    final recordSnapshot -> agg.stop() -> consumer.join() (final drain + last frame)
    summary: messages · adds/deletes/reduces/replaces · consumed / drops · final book
@@ -271,3 +282,42 @@ Two properties worth noting:
   the consumer keeps up and the 64K ring absorbs bursts -> typically `drops = 0`. Forcing drops
   means outpacing the consumer: shrink the ring, pick a hot symbol at `--pace=0`, or share one
   core.
+
+### 2E · Snapshot serialization and UDP transport
+
+`render()` already computes a full per-cycle view to paint the console. That view is now captured
+once as a `MetricsSnapshot` (header counters · book line · per-op ops/s · count · p50 / p99 / p99.9 ·
+max, in ns) and fanned out: the console "top" view is one consumer, an optional **sink** is the other
+— the seam every off-box transport attaches to.
+
+```
+  Aggregator.render()   (CORE B, ~5 Hz, off the hot path)
+        |
+        │ (builds ONE MetricsSnapshot per cycle)
+        |
+        ├──────────────> console "top" view          setConsole(true)   (default)
+        └──────────────> sink(const MetricsSnapshot&) setSnapshotSink(...)
+                              │
+                 ┌────────────┴─────────────┐ 
+                 |                          |                                           
+        writeJson() -> NDJSON        UdpPublisher::send()
+        json_snapshot_demo           writeJson() -> sendto() ONE datagram
+        (one JSON line / cycle)      udp_publish_demo -> 127.0.0.1:9099
+                                              │  fire-and-forget UDP
+                                              |
+                                          Python UDP
+                                              |
+                                          WebSocket bridge
+                                              |
+                                          uPlot dashboard
+```
+
+Design notes:
+- **One snapshot, many sinks.** The same struct feeds the console, the NDJSON logger, and the UDP
+  publisher, so they can never disagree — all three read the identical numbers.
+- **Everything off the hot path.** Snapshot build, JSON, and `sendto` all run on Core B at the render
+  cadence; the producer never serializes and never touches a socket.
+- **One snapshot == one UDP datagram.** `writeJson()` stays well under an MTU (~600-800 B with five
+  op rows), so there is no framing to reassemble; a lost datagram just skips a dashboard frame.
+
+<to_be_continued>
