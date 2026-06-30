@@ -25,6 +25,11 @@ struct Alert {
     char        text[80] = {0};   // human-readable message
 };
 
+struct DepthLevel { int64_t px = 0; int64_t qty = 0; };          // one ladder level
+struct TradeRec   { int64_t px = 0; int64_t qty = 0; uint64_t maker = 0; };  // one tape print
+
+enum : uint32_t { MAX_DEPTH = 10, MAX_TAPE = 16 };
+
 struct MetricsSnapshot {
     double      uptime_s = 0;
     bool        final    = false;
@@ -40,6 +45,11 @@ struct MetricsSnapshot {
     OpStat      ops[8];
     uint32_t    num_alerts = 0;
     Alert       alerts[8];
+    // book depth ladder (top-N, best inward) + recent trade tape (newest first)
+    uint32_t    nbids = 0, nasks = 0;
+    DepthLevel  bids[MAX_DEPTH], asks[MAX_DEPTH];
+    uint32_t    ntape = 0;
+    TradeRec    tape[MAX_TAPE];
 };
 
 // Bounded append helper: never writes past `cap`, keeps `n` clamped, buf stays NUL-terminated.
@@ -88,6 +98,21 @@ inline size_t writeJson(const MetricsSnapshot& s, char* buf, size_t cap) {
         jappend(buf, cap, n, "%s{\"level\":\"%s\",\"code\":\"%s\",\"text\":\"%s\"}",
                 i ? "," : "", a.level, a.code, a.text);
     }
+    // depth ladder as [price, qty] pairs (bids best-first, asks best-first)
+    jappend(buf, cap, n, "],\"bids\":[");
+    for (uint32_t i = 0; i < s.nbids; ++i)
+        jappend(buf, cap, n, "%s[%lld,%lld]", i ? "," : "",
+                (long long)s.bids[i].px, (long long)s.bids[i].qty);
+    jappend(buf, cap, n, "],\"asks\":[");
+    for (uint32_t i = 0; i < s.nasks; ++i)
+        jappend(buf, cap, n, "%s[%lld,%lld]", i ? "," : "",
+                (long long)s.asks[i].px, (long long)s.asks[i].qty);
+    // trade tape as [price, qty, makerId], newest first
+    jappend(buf, cap, n, "],\"tape\":[");
+    for (uint32_t i = 0; i < s.ntape; ++i)
+        jappend(buf, cap, n, "%s[%lld,%lld,%llu]", i ? "," : "",
+                (long long)s.tape[i].px, (long long)s.tape[i].qty,
+                (unsigned long long)s.tape[i].maker);
     jappend(buf, cap, n, "]}");
     return n;
 }

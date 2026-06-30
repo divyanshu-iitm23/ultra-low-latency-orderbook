@@ -66,7 +66,9 @@ PHASE 2: REAL-TIME MONITORING DASHBOARD (Ops)
     ├──  UDP snapshot publisher (C++) — fire-and-forget, one snapshot per datagram
     ├──  UDP -> WebSocket bridge (Python, asyncio + websockets)
     ├──  Browser dashboard v1 (single HTML + uPlot) — percentiles, throughput, book
-    └──  [todo] Book-depth ladder, alerts, historical playback
+    ├──  Alert rules in the aggregator (p99 · spread · drops · crossed-book)
+    ├──  Book-depth ladder + trade tape (seqlock depth channel + Trade-event tape)
+    └──  NDJSON logging + historical playback (bridge --log + ndjson_playback.py)
 
 PHASE 3: FPGA UDP PACKET PARSER (Hardware)
 │
@@ -1165,10 +1167,85 @@ assets returning 200, and a contract check confirming the fields the JS reads (`
 percentiles, `s.book`, `s.t/events/drops`) match real wire output — which caught a genuine bug (the op
 key is `op`, not `name`) before it ever reached a browser.
 
-*Current state:* The full chain runs end to end —
-engine → aggregator → `writeJson()` → UDP → bridge → WebSocket → browser charts — and the console "top"
-view and the browser render the *same* snapshot, so they can never disagree. What remains in Phase 2 is: a book-depth ladder + trade tape, alert rules inside the C++ aggregator (p99 breach, spread
-blowout, drops, crossed-book), and NDJSON logging with historical playback.
+*Current state:* — the full chain runs end to end:
+engine → aggregator → `writeJson()` → UDP → bridge → WebSocket → browser charts, and the console "top"
+view and the browser render the *same* snapshot, so they can never disagree.
+
+## Depth, alerts, history
+
+### Operational alerts
+
+With the snapshot reaching every consumer, the aggregator can do more than display — it can *judge*.
+Four rules run on Core B each render cycle, evaluated by a pure function (`evaluateAlerts()`, so the
+logic is unit-testable in isolation) and written straight back into the snapshot, so the alerts ride the
+same path the numbers already do — identical on the console, in the JSON/UDP, and on the dashboard:
+
+- **crossed book** → *crit* — `bid ≥ ask`, the "should never fire" correctness alarm that brings the
+  Phase-1 crossed-book invariant full circle as a live guardrail.
+- **spread blowout** → *warn* — book spread over a configurable threshold.
+- **drops** → *warn* — fires on the *delta* (new drops this interval), not the sticky cumulative, so it
+  flags the moment the consumer starts falling behind rather than latching forever.
+- **per-op p99 breach** → *warn* — any op whose window p99 exceeds a threshold (default 5 µs), skipped
+  when latencies are uncalibrated.
+
+Each alert carries a level, a code, and a human-readable message; they serialize into an `"alerts"`
+array on the snapshot JSON, print as `ALERT [level] text` under the console table, and light a banner on
+the dashboard (red for crit, amber for warn). A deterministic test (`test_alerts`, under CTest) drives a
+hand-built snapshot through each rule and asserts it both fires *and* clears; the live path was confirmed
+by pushing a crossed book through the real aggregator and seeing the crit alert surface in the JSON.
+
+### Book depth & trade tape
+
+The dashboard so far showed *behavior* (latencies, throughput) but only the top of book. A real ops view
+also wants **market structure** — the depth ladder and the trade tape. Both needed a new path to the
+consumer, because the SPSC ring carries fixed 32-byte events and a top-N ladder is far too big for one.
+
+- **Depth** travels a **seqlock side-channel** (`BookPublisher`). The producer owns the `OrderBook`, so
+  it walks the top-N levels with a new `OrderBook::getDepth()` (best inward, off the hot path at ~5 Hz)
+  and publishes a `BookView`; the aggregator reads a consistent copy lock-free each render — the same
+  pattern it already uses to poll the producer's drops atomic. The ring stays reserved for hot-path
+  events; the bulky, low-rate depth rides its own channel.
+- **The trade tape** reuses the existing `Trade` events: the aggregator keeps a small ring of the most
+  recent executions (price · qty · maker), newest first.
+
+Both land in the snapshot — `"bids"`/`"asks"` as `[price, qty]` pairs and `"tape"` as
+`[price, qty, maker]` — so they flow through the same JSON/UDP/WebSocket path to the dashboard, which
+renders a classic ladder (asks above, bids below, bar width ∝ resting size) and an upticked/downticked
+tape. `book_dashboard_demo` drives a genuine two-sided book and crosses it with market orders
+(`submitMarket`) so depth *and* trades are live. Verified end to end: a captured datagram carried 10 bid
+levels, 10 ask levels, and a full 16-print tape; `getDepth()` itself has a deterministic test
+(`test_depth`, top-N · aggregation · ordering · cap · emptying).
+
+### Recording & playback
+
+The last piece is history — capturing a session and replaying it. Both live in the Python transport
+layer, so there are no engine changes. The bridge gains a `--log` flag that tees every datagram it relays
+into an NDJSON file — source-agnostic, so it records a synthetic run, the depth/tape demo, or a real ITCH
+`--udp` feed, all while still serving the live dashboard. `ndjson_playback.py` then re-streams a recorded
+file back over UDP, paced by each snapshot's own `t` (with a speed multiplier), so the session flows
+through the *same* UDP → bridge → WebSocket → dashboard path it was recorded from — a past session
+scrubbed in the browser with no engine running. Verified end to end: a recorded 16-frame session (depth
+and tape included) replayed back **identically — lossless**.
+
+## Phase 2: Conclusion
+
+Phase 2 set out to make the Phase-1 engine *observable* without disturbing it, and to surface that on a
+live browser dashboard. Both are demonstrated, each with evidence:
+
+| Claim | Evidence |
+|---|---|
+| **Near-zero overhead** | instrumentation A/B: **+1.5 ns** detached, **+41 ns** while recording every op; *zero* machine code when compiled off |
+| **Lock-free, race-free** | SPSC ring is ThreadSanitizer-clean; cache-line padding worth **2.4×** two-core throughput (the deferred Phase-1 demo, now shown) |
+| **Live, end to end** | engine → ring → aggregator → JSON → UDP → WebSocket → uPlot browser charts, driven by synthetic *or* real NASDAQ data |
+| **Operationally complete** | per-op percentiles, throughput, a book-depth ladder, a trade tape, and four alert rules (incl. the crossed-book guardrail) |
+| **Recordable** | sessions logged to NDJSON and replayed losslessly through the same pipeline |
+
+The arc of the phase: a 32-byte event and a lock-free ring → an aggregator that turns raw events into
+live percentiles → transport (JSON / UDP / WebSocket) to a browser → enrichment (depth, tape, alerts,
+history). One thread runs throughout: **the hot path only ever stamps and pushes** — every expensive
+thing (histograms, serialization, sockets, rendering) lives on the consumer core, so observing the engine
+never throttles it. And the crossed-book invariant comes full circle once more: written in Phase 1,
+*enforced* by the matcher, it is now a **live alert that should never fire**.
 
 ---
 
@@ -1226,6 +1303,8 @@ cmake -S . -B build-baseline -DENABLE_METRICS=OFF && cmake --build build-baselin
 | `test_spsc` | SPSC ring torture test (FIFO, no loss/dup, drop accounting) |
 | `test_instrument` | recorder event-flow + `consumed + drops == attempted` accounting |
 | `test_engine_wiring` | one correctly-typed event per `add`/`cancel`/`modify`; detach silences |
+| `test_alerts` | operational alert rules (crossed / spread / drops / p99 fire and clear) |
+| `test_depth` | `OrderBook::getDepth()` — top-N, aggregation, ordering, cap, emptying |
 | `aggregator_demo` | synthetic producer + aggregator live "top" readout |
 | `engine_metrics_demo` | real `OrderBook` driven by synthetic churn, timed live |
 | `itch_metrics_replay` | real NASDAQ ITCH feed -> live per-op latency monitor |
@@ -1233,12 +1312,14 @@ cmake -S . -B build-baseline -DENABLE_METRICS=OFF && cmake --build build-baselin
 | `bench_false_sharing_padded` / `_nopad` | SPSC false-sharing A/B (padded vs `-DSPSC_NO_PAD`) |
 | `json_snapshot_demo` | aggregator snapshot as NDJSON (dashboard data source) |
 | `udp_publish_demo` | publish each snapshot as one JSON UDP datagram (transport) |
+| `book_dashboard_demo` | live two-sided book + trades -> depth ladder + trade tape (console + UDP) |
 
 Running the tests:
 
 ```bash
-# CTest runs the registered tests: the GoogleTest order-book suite + the engine-wiring test
+# CTest runs the registered tests: GoogleTest order-book suite + depth + engine-wiring + alerts
 ctest --test-dir build-metrics --output-on-failure
+#   Start 1: OrderBookTests   Start 2: Depth   Start 3: EngineWiring   Start 4: Alerts
 
 # the remaining test binaries are run directly
 ./build-metrics/test_matching                  # matching scenarios + crossed-book invariant
@@ -1368,15 +1449,30 @@ an unbound port are silently dropped:
 python3 dashboard/udp_ws_bridge.py 9099 8765
 
 # terminal 2 - the data source: prints the console "top" view AND publishes UDP to the bridge.
-#   (a) synthetic order flow through the real engine:
+#   (a) synthetic order flow through the real engine (latencies + throughput):
 ./build-metrics/udp_publish_demo 60 127.0.0.1 9099
-#   (b) ...or a REAL NASDAQ ITCH feed (pace it so the charts move; --no-prefault = fast start):
+#   (b) two-sided book with trades -> also fills the depth ladder + trade tape panels:
+./build-metrics/book_dashboard_demo 60 127.0.0.1 9099
+#   (c) ...or a REAL NASDAQ ITCH feed (pace it so the charts move; --no-prefault = fast start):
 ./build-metrics/itch_metrics_replay ~/market-data/<file>.NASDAQ_ITCH50 AAPL --pace=10 --no-prefault --udp
-#   (append  > /dev/null  to either for headless publish-only)
+#   (append  > /dev/null  to any for headless publish-only)
 
 # browser - open the dashboard (auto-connects to ws://127.0.0.1:8765, auto-reconnects)
 xdg-open dashboard/index.html
 #   or serve it:  ( cd dashboard && python3 -m http.server 8000 )  then open http://localhost:8000
+```
+
+Recording a session and replaying it later (the `--log` tee + the playback tool):
+
+```bash
+# record: the bridge tees every snapshot to NDJSON while still serving the dashboard
+python3 dashboard/udp_ws_bridge.py 9099 8765 --log=session.ndjson
+./build-metrics/book_dashboard_demo 60 127.0.0.1 9099     # any UDP source is recorded
+
+# replay later: start a fresh bridge, then re-stream the file at its recorded cadence
+python3 dashboard/udp_ws_bridge.py 9099 8765
+python3 dashboard/ndjson_playback.py session.ndjson --speed=1   # 0 = blast, 10 = 10x, --loop to repeat
+#   then open dashboard/index.html to scrub the recorded session - no engine needed
 ```
 
 Running the live monitors (use a real terminal for the in-place "top" view):

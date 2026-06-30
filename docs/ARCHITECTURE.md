@@ -191,13 +191,18 @@ on Core B where it can never throttle the engine. Drop-on-full is the release va
         |- latency_histogram.hpp  log-linear percentile histogram (consumer side)
         |- aggregator.hpp         consumer thread: drain -> histograms -> "top" readout
         |- metrics_snapshot.hpp   MetricsSnapshot + writeJson() (consumer-side, ~5 Hz)
+        |- metrics_alerts.hpp     AlertConfig + pure evaluateAlerts() (p99/spread/drops/crossed)
+        |- book_view.hpp          BookView + BookPublisher (seqlock depth side-channel)
         |- udp_publisher.hpp      UdpPublisher: one snapshot -> one JSON UDP datagram
-     aggregator_demo.cpp    end-to-end demo (synthetic producer + aggregator)
+     aggregator_demo.cpp     end-to-end demo (synthetic producer + aggregator)
      engine_metrics_demo.cpp  real OrderBook + synthetic churn, timed live
      itch_metrics_replay.cpp  real NASDAQ ITCH feed -> BookReplay -> live readout (paced)
      json_snapshot_demo.cpp   aggregator snapshot -> NDJSON on stdout
      udp_publish_demo.cpp     aggregator snapshot -> JSON UDP datagrams
+     book_dashboard_demo.cpp  two-sided book + trades -> depth ladder + trade tape
      test_engine_wiring.cpp   deterministic: one typed event per add/cancel/modify
+     test_alerts.cpp          alert rules fire and clear
+     test_depth.cpp           getDepth(): top-N, aggregation, ordering, cap, emptying
      test_instrument.cpp
      test_spsc.cpp
 ```
@@ -332,9 +337,47 @@ Built: hot path · ring · aggregator · console view · snapshot JSON · UDP pu
 Python UDP->WebSocket bridge · uPlot browser dashboard. The full chain runs end to end:
   engine -> aggregator -> writeJson -> UDP :9099 -> udp_ws_bridge.py -> ws://:8765 -> browser.
 `udp_publish_demo` keeps the console on while publishing, so the console and browser show the same
-snapshot at once. Next: book-depth ladder + trade tape, alert rules inside the aggregator,
-NDJSON logging + historical playback.
+snapshot at once. Section 2F adds alerts, a depth ladder + trade tape, and session record/replay.
 
    Web layer (dashboard/):
-     udp_ws_bridge.py   Python asyncio relay: UDP datagrams -> WebSocket text frames
-     index.html         single-file uPlot dashboard (charts + header + table)
+     udp_ws_bridge.py    Python asyncio relay: UDP -> WebSocket text frames (--log tees to NDJSON)
+     ndjson_playback.py  re-stream a recorded NDJSON session over UDP, paced by `t`
+     index.html          single-file uPlot dashboard: charts · header · depth ladder · tape · alerts
+
+### 2F · depth, alerts, history
+
+This part enriches the snapshot the aggregator already publishes. The hot path is untouched; everything
+is added on Core B (or in the Python transport).
+
+```
+   PRODUCER (Core A / engine)                  AGGREGATOR (Core B)             snapshot gains
+   ─────────────────────────                   ───────────────────            ──────────────
+   ScopedLatency ─► ring.try_push ══ SPSC ══►   ingest()                       ops[] (latency)
+   recordTrade   ─► ring (Trade event) ══════►  trade-tape ring (last 16) ───► tape[]
+   getDepth() ─► BookPublisher.publish ┄seqlock┄► read() each render ────────► bids[] / asks[]
+   drops_++ (atomic) ◄──── dropsCounter() ────  poll each render          ───► drops
+                                                evaluateAlerts(snapshot) ────► alerts[]
+                                                       │
+                                                       ▼  writeJson() -> UDP -> bridge -> dashboard
+```
+
+- **Alerts** are a pure function of the snapshot (`evaluateAlerts`), run each render: crossed-book (crit),
+  spread blowout, drops-delta, per-op p99 breach. They serialize into `"alerts"` and show on the console,
+  in the JSON, and as a dashboard banner. The crossed-book rule is the Phase-1 invariant as a live alarm.
+- **Depth** can't ride the ring (a top-N ladder dwarfs a 32-byte event), so it takes a separate
+  **seqlock side-channel**: the producer owns the book and `getDepth()`s the top-N levels ~5 Hz into a
+  `BookPublisher`; the aggregator reads a consistent copy lock-free each render. The ring stays reserved
+  for hot-path events.
+- **The trade tape** needs no new channel — it reuses the existing `Trade` events, kept newest-first in a
+  small ring on the aggregator.
+- **History** lives entirely in the Python layer:
+
+```
+   record:  any UDP source ─► udp_ws_bridge.py --log=session.ndjson ─► NDJSON file (+ live WS)
+   replay:  session.ndjson  ─► ndjson_playback.py ─► UDP :9099 ─► udp_ws_bridge.py ─► browser
+            (paced by each snapshot's `t`; no engine running — scrub a past session)
+```
+
+PHASE 2 COMPLETE — the engine is observable end to end: instrumented hot path -> lock-free ring ->
+aggregator (percentiles · depth · tape · alerts) -> JSON -> UDP -> WebSocket -> browser, sessions
+recordable and replayable, and the hot path never blocking, allocating, or serializing.

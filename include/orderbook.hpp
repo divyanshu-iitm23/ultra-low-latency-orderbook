@@ -19,6 +19,9 @@ struct Trade {
     Side     takerSide;  // side of the aggressor
 };
 
+// One level of book depth: a price and the total resting quantity at it.
+struct DepthLevel { Price price; Quantity qty; };
+
 class OrderBook {
 public:
     // Price ladder spans [min_price, max_price] in ticks. One allocation per side.
@@ -72,6 +75,22 @@ public:
     size_t getTotalOrders() const { return total_orders_; }
     size_t getActiveBids() const { return bid_count_; }
     size_t getActiveAsks() const { return ask_count_; }
+
+    // Top-N levels from the best inward: bids[] highest-price first, asks[] lowest first.
+    // Counts returned via *nbids / *nasks (each <= maxLevels). Read-only book walk.
+    void getDepth(int maxLevels, DepthLevel* bids, int* nbids,
+                  DepthLevel* asks, int* nasks) const {
+        int nb = 0;
+        for (int64_t i = best_bid_idx_; i >= 0 && nb < maxLevels; --i)
+            if (!bid_levels_[i].isEmpty())
+                bids[nb++] = { indexToPrice(i), bid_levels_[i].getTotalQuantity() };
+        *nbids = nb;
+        int na = 0;
+        for (int64_t i = best_ask_idx_; i >= 0 && i < (int64_t)num_levels_ && na < maxLevels; ++i)
+            if (!ask_levels_[i].isEmpty())
+                asks[na++] = { indexToPrice(i), ask_levels_[i].getTotalQuantity() };
+        *nasks = na;
+    }
 
 #if METRICS_ENABLED
     // Attach a recorder to time add/cancel/modify. Null (the default) records nothing.

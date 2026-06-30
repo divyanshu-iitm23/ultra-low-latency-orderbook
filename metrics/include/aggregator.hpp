@@ -17,6 +17,7 @@
 #include "latency_histogram.hpp"
 #include "metrics_snapshot.hpp"             // json snapshot serialization
 #include "metrics_alerts.hpp"               // operational alert rules
+#include "book_view.hpp"                    // depth side-channel (seqlock)
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,8 @@ public:
     void setConsole(bool on) { console_ = on; }
     // Configure the operational alert thresholds (evaluated each render cycle).
     void setAlerts(const AlertConfig& c) { alert_cfg_ = c; }
+    // Attach the producer's published book-depth channel (read each render cycle).
+    void setBookPublisher(const BookPublisher* b) { bookpub_ = b; }
 
     // Blocking drain+render loop. Runs until stop(); on exit it drains whatever
     // remains and paints a final frame so no tail events are lost.
@@ -101,6 +104,11 @@ private:
                 last_px_ = e.payload.trade.price;
                 volume_ += e.payload.trade.qty;
                 ++trades_;
+                tape_[tape_next_] = { e.payload.trade.price,
+                                      (int64_t)e.payload.trade.qty,
+                                      (uint64_t)e.payload.trade.maker };
+                tape_next_ = (tape_next_ + 1) % MAX_TAPE;
+                if (tape_n_ < MAX_TAPE) ++tape_n_;
                 break;
         }
     }
@@ -173,6 +181,20 @@ private:
             win_[op].reset();                         // start a fresh window
         }
 
+        // book depth: lock-free read of the producer's published ladder
+        if (bookpub_) {
+            BookView bv;
+            if (bookpub_->read(bv)) {
+                snap.nbids = bv.nbids; snap.nasks = bv.nasks;
+                for (uint32_t i = 0; i < bv.nbids; ++i) snap.bids[i] = bv.bids[i];
+                for (uint32_t i = 0; i < bv.nasks; ++i) snap.asks[i] = bv.asks[i];
+            }
+        }
+        // trade tape: copy the recent-trades ring, newest first
+        snap.ntape = tape_n_;
+        for (uint32_t i = 0; i < tape_n_; ++i)
+            snap.tape[i] = tape_[(tape_next_ + MAX_TAPE - 1 - i) % MAX_TAPE];
+
         evaluateAlerts(snap, alert_cfg_, last_drops_alert_);   // operational rules -> snap.alerts
 
         if (console_) {
@@ -233,6 +255,9 @@ private:
     std::function<void(const MetricsSnapshot&)> sink_;
     AlertConfig alert_cfg_;             // operational alert thresholds
     uint64_t    last_drops_alert_ = 0;  // for the drops-delta rule
+    const BookPublisher* bookpub_ = nullptr;        // depth side-channel (optional)
+    TradeRec    tape_[MAX_TAPE];        // recent-trades ring (for the tape)
+    uint32_t    tape_next_ = 0, tape_n_ = 0;
 
     std::atomic<bool> running_{true};
 

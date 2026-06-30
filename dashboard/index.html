@@ -23,6 +23,14 @@
   .alert{padding:4px 10px;border-radius:5px;font-size:12px;}
   .alert.warn{background:#3d2e00;color:#f0c674;border:1px solid #6b5200;}
   .alert.crit{background:#3d0d0d;color:#ff8a80;border:1px solid #8b1a1a;}
+  .dlvl{position:relative;display:flex;justify-content:space-between;padding:1px 8px;font-size:12px;}
+  .dbar{position:absolute;left:0;top:0;bottom:0;opacity:.16;z-index:0;}
+  .dlvl.ask .dbar{background:var(--bad);} .dlvl.bid .dbar{background:var(--ok);}
+  .dlvl span{position:relative;z-index:1;}
+  .dlvl.ask .dpx{color:#ff8a80;} .dlvl.bid .dpx{color:#7ee787;}
+  .dmid{height:0;border-top:1px dashed #30363d;margin:4px 0;}
+  .trow{display:flex;justify-content:space-between;padding:2px 8px;font-size:12px;border-bottom:1px solid #1c2128;}
+  .trow .up{color:#7ee787;} .trow .dn{color:#ff8a80;}
   .conn{margin-left:auto;display:flex;align-items:center;gap:8px;}
   main{padding:16px;display:grid;gap:16px;grid-template-columns:1fr 1fr;}
   .card{background:var(--panel);border:1px solid #21262d;border-radius:8px;padding:12px;}
@@ -61,6 +69,14 @@
   <div class="card">
     <h2>Throughput (ops/s) by op</h2>
     <div id="chart-thru"></div>
+  </div>
+  <div class="card">
+    <h2>Book depth (asks / bids)</h2>
+    <div id="depth"></div>
+  </div>
+  <div class="card">
+    <h2>Trade tape (newest first)</h2>
+    <div id="tape"></div>
   </div>
   <div class="card wide">
     <h2>Current snapshot</h2>
@@ -153,6 +169,28 @@
     }).join('');
   }
 
+  function renderDepth(bids, asks) {
+    bids = bids || []; asks = asks || [];
+    let maxq = 1;
+    for (const l of bids) if (l[1] > maxq) maxq = l[1];
+    for (const l of asks) if (l[1] > maxq) maxq = l[1];
+    const row = (l, cls) =>
+      '<div class="dlvl '+cls+'"><span class="dbar" style="width:'+Math.round(100*l[1]/maxq)+'%"></span>'+
+      '<span class="dpx">'+l[0]+'</span><span>'+fmtN(l[1])+'</span></div>';
+    const a = asks.slice().reverse().map(l => row(l,'ask')).join('');   // deepest ask on top
+    const b = bids.map(l => row(l,'bid')).join('');                     // best bid just below the spread
+    $('depth').innerHTML = a + '<div class="dmid"></div>' + b;
+  }
+
+  function renderTape(tape) {
+    tape = tape || [];
+    $('tape').innerHTML = tape.map((t, i) => {
+      const prev = tape[i+1];                                            // the older print
+      const cls = !prev ? '' : (t[0] > prev[0] ? 'up' : t[0] < prev[0] ? 'dn' : '');
+      return '<div class="trow"><span class="'+cls+'">'+t[0]+'</span><span>'+fmtN(t[1])+'</span></div>';
+    }).join('');
+  }
+
   function onSnap(s) {
     if (s.final) return;              // skip the empty shutdown-flush frame
     if (!ops) {
@@ -163,7 +201,8 @@
       buildCharts();
     }
     hist.push(s); if (hist.length > MAXPTS) hist.shift();
-    updateHeader(s); updateTable(s); renderAlerts(s.alerts); refresh();
+    updateHeader(s); updateTable(s); renderAlerts(s.alerts);
+    renderDepth(s.bids, s.asks); renderTape(s.tape); refresh();
     prev = s;
   }
 

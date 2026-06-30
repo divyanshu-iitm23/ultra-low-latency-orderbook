@@ -64,6 +64,11 @@ target_compile_options(itch_book_replay PRIVATE -O3 -march=native)
 add_executable(test_matching test_matching.cpp)
 target_link_libraries(test_matching orderbook_lib)
 
+# Book-depth (getDepth) test - engine-only, independent of metrics
+add_executable(test_depth metrics/test_depth.cpp)
+target_link_libraries(test_depth orderbook_lib)
+add_test(NAME Depth COMMAND test_depth)
+
 # Phase-2 metrics pipeline
 # SPSC ring torture test is independent of the METRICS_ENABLED switch.
 add_executable(test_spsc metrics/test_spsc.cpp)
@@ -121,4 +126,9 @@ if(ENABLE_METRICS)
     add_executable(udp_publish_demo metrics/udp_publish_demo.cpp)
     target_link_libraries(udp_publish_demo orderbook_lib pthread)
     target_compile_options(udp_publish_demo PRIVATE -O3 -march=native)
+
+    # Week 8: live two-sided book with trades -> depth ladder + trade tape on the dashboard
+    add_executable(book_dashboard_demo metrics/book_dashboard_demo.cpp)
+    target_link_libraries(book_dashboard_demo orderbook_lib pthread)
+    target_compile_options(book_dashboard_demo PRIVATE -O3 -march=native)
 endif()

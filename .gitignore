@@ -38,3 +38,6 @@ itch_perf2.data*
 data/*.itch
 data/*.pcap
 EOF
+
+# json
+session.ndjson*
