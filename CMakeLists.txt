@@ -93,6 +93,10 @@ if(ENABLE_METRICS)
     target_link_libraries(test_engine_wiring orderbook_lib pthread)
     add_test(NAME EngineWiring COMMAND test_engine_wiring)
 
+    # deterministic test of the operational alert rules (pure evaluateAlerts())
+    add_executable(test_alerts metrics/test_alerts.cpp)
+    add_test(NAME Alerts COMMAND test_alerts)
+
     # synthetic producer + aggregator live readout
     add_executable(aggregator_demo metrics/aggregator_demo.cpp)
     target_link_libraries(aggregator_demo pthread)

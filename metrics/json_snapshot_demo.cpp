@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     Aggregator agg(ring, rec.dropsCounter(), ns_per_tick, /*render_hz=*/5.0);
     agg.setConsole(false);                                   // NDJSON instead of "top" view
     agg.setSnapshotSink([](const MetricsSnapshot& s){
-        char buf[2048];
+        char buf[4096];
         size_t n = writeJson(s, buf, sizeof buf);
         fwrite(buf, 1, n, stdout);
         fputc('\n', stdout);

@@ -35,7 +35,7 @@ public:
     // Serialize the snapshot to JSON and send it as a single datagram.
     void send(const MetricsSnapshot& s) {
         if (!ok_) return;
-        char buf[2048];
+        char buf[4096];                 // room for ops + alerts; one datagram
         const size_t n = writeJson(s, buf, sizeof buf);
         const ssize_t w = ::sendto(fd_, buf, n, 0, (const sockaddr*)&dst_, sizeof(dst_));
         if (w == (ssize_t)n) ++sent_; else ++errors_;

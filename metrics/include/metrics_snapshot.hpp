@@ -18,6 +18,13 @@ struct OpStat {
     double      p50 = 0, p99 = 0, p999 = 0, max = 0;   // recent p50/p99/p99.9, all-time max
 };
 
+
+struct Alert {
+    const char* level = "warn";   // "warn" | "crit"
+    const char* code  = "?";      // "p99" | "spread" | "drops" | "crossed"
+    char        text[80] = {0};   // human-readable message
+};
+
 struct MetricsSnapshot {
     double      uptime_s = 0;
     bool        final    = false;
@@ -31,6 +38,8 @@ struct MetricsSnapshot {
     uint64_t    volume   = 0;
     uint32_t    num_ops  = 0;
     OpStat      ops[8];
+    uint32_t    num_alerts = 0;
+    Alert       alerts[8];
 };
 
 // Bounded append helper: never writes past `cap`, keeps `n` clamped, buf stays NUL-terminated.
@@ -72,6 +81,12 @@ inline size_t writeJson(const MetricsSnapshot& s, char* buf, size_t cap) {
             "\"p50\":%.1f,\"p99\":%.1f,\"p999\":%.1f,\"max\":%.1f}",
             i ? "," : "", o.name, o.ops_per_s, (unsigned long long)o.count,
             o.p50, o.p99, o.p999, o.max);
+    }
+    jappend(buf, cap, n, "],\"alerts\":[");
+    for (uint32_t i = 0; i < s.num_alerts; ++i) {
+        const Alert& a = s.alerts[i];
+        jappend(buf, cap, n, "%s{\"level\":\"%s\",\"code\":\"%s\",\"text\":\"%s\"}",
+                i ? "," : "", a.level, a.code, a.text);
     }
     jappend(buf, cap, n, "]}");
     return n;

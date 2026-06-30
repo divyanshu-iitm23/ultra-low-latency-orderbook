@@ -62,9 +62,10 @@ PHASE 2: REAL-TIME MONITORING DASHBOARD (Ops)
 │
 └── # Real-time visualization
     |
-    ├──  [done] Snapshot serialization (JSON) — aggregator sink, NDJSON, off hot path
-    ├──  [done] UDP snapshot publisher (C++) — fire-and-forget, one snapshot per datagram
-    ├──  [todo] UDP -> WebSocket bridge + browser dashboard (uPlot)
+    ├──  Snapshot serialization (JSON) — aggregator sink, NDJSON, off hot path
+    ├──  UDP snapshot publisher (C++) — fire-and-forget, one snapshot per datagram
+    ├──  UDP -> WebSocket bridge (Python, asyncio + websockets)
+    ├──  Browser dashboard v1 (single HTML + uPlot) — percentiles, throughput, book
     └──  [todo] Book-depth ladder, alerts, historical playback
 
 PHASE 3: FPGA UDP PACKET PARSER (Hardware)
@@ -236,13 +237,13 @@ Each entry records what changed, the reasoning, and the measured outcome. All la
 figures are `addOrder`, RDTSC harness, pinned core, median-of-seven, timer-overhead
 subtracted, on 16-core bare-metal Linux.
 
-### 1. Object pool allocator — **kept**
+### 1. Object pool allocator
 Removed `new`/`delete` from the hot path. Eliminated the dominant allocation-induced tail
 spike (early chrono-based measurement showed a ~775 µs worst-case sample collapse). Also
 improved typical-case latency via cache locality. *The first and most impactful correctness-
 for-determinism change.*
 
-### 2. Cache-line alignment of `Order` — **kept (neutral)**
+### 2. Cache-line alignment of `Order`
 Aligned `Order` to 64 bytes so each order occupies exactly one cache line. Measured as
 within run-to-run noise on the single-threaded workload — possibly a hair slower due to
 reduced density. Kept for documentation and future multi-threaded relevance. *A correct
@@ -258,7 +259,7 @@ pre-generates inputs (so the RNG is never inside the timed region), warms up
 caches/branch-predictor/frequency, pins a core, and reports median-of-seven for stability.
 *This is what made every subsequent comparison trustworthy.*
 
-### 4. `std::map` → direct-mapped array + occupancy bitmap — **kept (largest win)**
+### 4. `std::map` → direct-mapped array + occupancy bitmap
 
 | Metric | `std::map` | array + bitmap | Improvement |
 |---|---:|---:|---:|
@@ -289,7 +290,7 @@ open-addressing table (expensive hash, lengthening linear probes, rehash-on-grow
 slower than a tuned `std::unordered_map`. Reverted. The dead-end is documented because the
 discipline it demonstrates — measure, then decide — is the point.
 
-### 6. Symbol filter: `strcmp` → `uint64_t` compare — **kept**
+### 6. Symbol filter: `strcmp` → `uint64_t` compare
 Surfaced by profiling the ITCH replay, not the synthetic benchmark. The replay filters the
 feed to one symbol; the original filter did a `strcmp` of the 8-byte stock field on every
 Add message. Profiling showed `__strcmp_avx2` was **12.88%** of replay time — about **eight
@@ -391,7 +392,7 @@ justifies in the order book itself. The synthetic benchmark gives the latency st
 book is ~1.6%; the cost is I/O plus a symbol filter that has been removed). Both are
 complete and evidence-backed.
 
-### Order Book's performance on Real ITCH feed
+### Parsing Real ITCH feed
 ```
 For a subset of data (~500 Mb)
 
@@ -977,6 +978,25 @@ Two refinements make it a monitor rather than a batch run:
   `--no-prefault` switches to lazy faulting so the live view appears immediately (at the cost
   of one-time page-fault jitter in the earliest samples). Ctrl-C stops cleanly and still
   prints the summary.
+- **Driving the dashboard.** `--udp[=host:port]` attaches the UDP publisher as a snapshot sink
+  (default `127.0.0.1:9099`), so the same paced ITCH feed that prints the console "top" view also
+  streams through the bridge to the browser dashboard — real NASDAQ latencies on a live chart, with
+  the console kept on. Pace it (`--pace=10`) so the file spans wall-clock time and the charts move.
+
+> **Note — why `--no-prefault` changes the reported latency and throughput.** Lazy loading moves the
+> file's page faults *into* the measured run instead of paying them up front, and that shows up two
+> ways. **Throughput drops:** every minor fault is microseconds of kernel time spent inside the ops/s
+> window, and there are tens of thousands of them for a large file. **The latency tail widens:** the
+> fault itself happens in the parser (reading the mapped bytes), *outside* the `ScopedLatency` scope —
+> but the fault handler pollutes the cache and TLB, so the *next* timed op runs cold and its p99.9/max
+> inflate. The **median (p50) barely moves**, because the book work is identical in both modes and most
+> ops aren't adjacent to a fault. Both effects are **one-time and front-loaded** — each page faults once
+> on first touch (a sequential walk), so the gap is largest in the first second or two and then converges
+> to the prefault numbers as the working set becomes resident. Magnitude depends on the page cache: an
+> already-cached file takes cheap *minor* faults; a cold file takes *major* faults (real disk reads) that
+> cause large early spikes. So for clean, comparable numbers use prefault (the LOAD-phase wait buys a
+> fault-free measured region); with `--no-prefault` you get an instant view but should read steady-state
+> and discount the first few frames.
 
 ### Overhead A/B: the cost of being watched
 
@@ -1117,11 +1137,38 @@ the real engine and aims datagrams at `127.0.0.1:9099`. End-to-end verification 
 receiver: a three-second run sent **16 datagrams, 0 errors**, and the receiver got all **16, every one
 valid JSON** — the same payload the console shows, now on the wire.
 
-*Current state:* the C++ side of the transport chain is complete —
-engine → aggregator → `MetricsSnapshot` → `writeJson()` → UDP datagrams. What remains is the
-browser-facing half: a small Python UDP→WebSocket bridge (browsers cannot read UDP directly) and a
-single-file uPlot dashboard. Once both exist, `udp_publish_demo` — or the paced ITCH replay — can drive a
-live browser dashboard straight from real NASDAQ data.
+### UDP → WebSocket bridge
+
+The last hop into the browser. A browser cannot open a UDP socket, so a tiny Python relay sits between
+the publisher and the page: `dashboard/udp_ws_bridge.py` (asyncio + the `websockets` library) receives
+each datagram on UDP `:9099` and `broadcast()`s it, unchanged, as a WebSocket **text frame** to every
+client connected on `ws://127.0.0.1:8765`. It is deliberately stateless — no parsing, no buffering, no
+reassembly (one snapshot == one datagram == one frame); a client that falls behind is simply dropped.
+That keeps the C++ side honestly fire-and-forget and the browser side a thin consumer.
+
+It was tested without a browser by standing a WebSocket client in for the dashboard: with the bridge up,
+a three-second publisher run delivered all **16 frames over the WebSocket, every one valid JSON** — the
+same payload, now one `JSON.parse()` away from a chart. Start order matters: the bridge must be listening
+before the publisher sends, since datagrams to an unbound port are silently dropped.
+
+### Dashboard v1
+
+The page itself — one self-contained `dashboard/index.html` (uPlot from a CDN, no build step). It opens
+a WebSocket to `ws://127.0.0.1:8765`, `JSON.parse`s each frame, drops the `final` flush frame, and keeps
+a rolling history. From that it draws two live charts — per-op p50/p99/p99.9 over time (with an op
+selector) and throughput by op — above a header strip (uptime · events/s · drops · bid/ask/spread, with
+a connection light) and a current-snapshot table that mirrors the console "top" view. The socket
+auto-reconnects, so the page can be left open across publisher restarts.
+
+It was verified as far as a browserless check allows: `node --check` on the inline script, both CDN
+assets returning 200, and a contract check confirming the fields the JS reads (`s.ops[].op`, the
+percentiles, `s.book`, `s.t/events/drops`) match real wire output — which caught a genuine bug (the op
+key is `op`, not `name`) before it ever reached a browser.
+
+*Current state:* The full chain runs end to end —
+engine → aggregator → `writeJson()` → UDP → bridge → WebSocket → browser charts — and the console "top"
+view and the browser render the *same* snapshot, so they can never disagree. What remains in Phase 2 is: a book-depth ladder + trade tape, alert rules inside the C++ aggregator (p99 breach, spread
+blowout, drops, crossed-book), and NDJSON logging with historical playback.
 
 ---
 
@@ -1184,8 +1231,8 @@ cmake -S . -B build-baseline -DENABLE_METRICS=OFF && cmake --build build-baselin
 | `itch_metrics_replay` | real NASDAQ ITCH feed -> live per-op latency monitor |
 | `benchmark_overhead` | instrumentation overhead A/B (built in **both** configs) |
 | `bench_false_sharing_padded` / `_nopad` | SPSC false-sharing A/B (padded vs `-DSPSC_NO_PAD`) |
-| `json_snapshot_demo` | aggregator snapshot as NDJSON (Week-7 dashboard data source) |
-| `udp_publish_demo` | publish each snapshot as one JSON UDP datagram (Week-7 transport) |
+| `json_snapshot_demo` | aggregator snapshot as NDJSON (dashboard data source) |
+| `udp_publish_demo` | publish each snapshot as one JSON UDP datagram (transport) |
 
 Running the tests:
 
@@ -1312,6 +1359,26 @@ nc -u -l 9099
 ./build-metrics/udp_publish_demo 8 127.0.0.1 9099
 ```
 
+The full live stack — the console "top" view and the browser dashboard at the same time, off one
+engine (both read the SAME snapshot, so they always agree). Start the bridge first, since datagrams to
+an unbound port are silently dropped:
+
+```bash
+# terminal 1 - the bridge: UDP :9099 -> ws://127.0.0.1:8765
+python3 dashboard/udp_ws_bridge.py 9099 8765
+
+# terminal 2 - the data source: prints the console "top" view AND publishes UDP to the bridge.
+#   (a) synthetic order flow through the real engine:
+./build-metrics/udp_publish_demo 60 127.0.0.1 9099
+#   (b) ...or a REAL NASDAQ ITCH feed (pace it so the charts move; --no-prefault = fast start):
+./build-metrics/itch_metrics_replay ~/market-data/<file>.NASDAQ_ITCH50 AAPL --pace=10 --no-prefault --udp
+#   (append  > /dev/null  to either for headless publish-only)
+
+# browser - open the dashboard (auto-connects to ws://127.0.0.1:8765, auto-reconnects)
+xdg-open dashboard/index.html
+#   or serve it:  ( cd dashboard && python3 -m http.server 8000 )  then open http://localhost:8000
+```
+
 Running the live monitors (use a real terminal for the in-place "top" view):
 
 ```bash
@@ -1327,6 +1394,8 @@ taskset -c 2,3 ./build-metrics/itch_metrics_replay ~/market-data/*.NASDAQ_ITCH50
 #     --no-prefault  lazy load: the live view appears instantly and pages fault in as
 #                    the parser reaches them (early samples carry one-time fault jitter),
 #                    instead of pre-faulting the whole file with MAP_POPULATE.
+#     --udp[=H:P]    also publish each snapshot as a UDP datagram (default 127.0.0.1:9099)
+#                    -> bridge -> browser dashboard
 ```
 
 Market data is the NASDAQ TotalView-ITCH 5.0 historical sample (binary, gzip-compressed).

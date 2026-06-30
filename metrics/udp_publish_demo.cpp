@@ -51,7 +51,9 @@ int main(int argc, char** argv) {
     book.setMetrics(&rec);
 
     Aggregator agg(ring, rec.dropsCounter(), ns_per_tick, /*render_hz=*/5.0);
-    agg.setConsole(false);                                   // publish only
+    // console + UDP run off the SAME snapshot: watch the "top" view here AND drive the
+    // browser at once. Redirect stdout (> /dev/null) for headless publish-only.
+    agg.setConsole(true);
     agg.setSnapshotSink([&pub](const MetricsSnapshot& s){ pub.send(s); });
 
     std::thread hot([&]{

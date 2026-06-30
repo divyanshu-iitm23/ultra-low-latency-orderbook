@@ -8,6 +8,7 @@
 #include "book_replay.hpp"          // OrderBook + BookReplay + itch::parseBuffer
 #include "metrics_recorder.hpp"
 #include "aggregator.hpp"
+#include "udp_publisher.hpp"        // optional --udp sink -> bridge -> browser dashboard
 #include "rdtsc_timer.hpp"          // orderbook::TscClock (ticks -> ns)
 
 #include <fcntl.h>
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 using namespace orderbook;
 namespace m = metrics;
@@ -62,7 +64,9 @@ int main(int argc, char** argv) {
             "  --pace=<F>     replay speed: 0=max (default), 1=real-time, 10=10x\n"
             "  --snap=<N>     snapshot every N messages (default 8192)\n"
             "  --no-prefault  lazy load (live view instant; early samples carry one-time\n"
-            "                 page-fault jitter) instead of MAP_POPULATE prefault\n",
+            "                 page-fault jitter) instead of MAP_POPULATE prefault\n"
+            "  --udp[=H:P]    also publish each snapshot as a UDP datagram (default\n"
+            "                 127.0.0.1:9099) -> bridge -> browser dashboard\n",
             argv[0]);
         return 1;
     }
@@ -71,10 +75,27 @@ int main(int argc, char** argv) {
     double   pace       = 0.0;       // 0 => max throughput (no pacing)
     uint64_t snap_every = 8192;
     bool     prefault   = true;
+    bool     udp        = false;
+    char     udp_host[64] = "127.0.0.1";
+    uint16_t udp_port   = 9099;
     for (int i = 3; i < argc; ++i) {
         if      (!strncmp(argv[i], "--pace=", 7)) pace = atof(argv[i] + 7);
         else if (!strncmp(argv[i], "--snap=", 7)) snap_every = strtoull(argv[i] + 7, nullptr, 10);
         else if (!strcmp (argv[i], "--no-prefault")) prefault = false;
+        else if (!strcmp (argv[i], "--udp")) udp = true;
+        else if (!strncmp(argv[i], "--udp=", 6)) {
+            udp = true;
+            const char* hp = argv[i] + 6;
+            const char* colon = strrchr(hp, ':');
+            if (colon) {                         // host:port
+                size_t hlen = (size_t)(colon - hp);
+                if (hlen >= sizeof(udp_host)) hlen = sizeof(udp_host) - 1;
+                memcpy(udp_host, hp, hlen); udp_host[hlen] = 0;
+                udp_port = (uint16_t)atoi(colon + 1);
+            } else {                             // port only
+                udp_port = (uint16_t)atoi(hp);
+            }
+        }
         else { fprintf(stderr, "unknown option: %s\n", argv[i]); return 1; }
     }
     if (snap_every == 0) snap_every = 8192;
@@ -123,6 +144,17 @@ int main(int argc, char** argv) {
     BookReplay rp(book, sym);
     m::Aggregator agg(ring, rec.dropsCounter(), ns_per_tick, /*render_hz=*/5.0);
 
+    // optional UDP sink -> bridge -> browser dashboard (the console "top" view stays on)
+    std::unique_ptr<m::UdpPublisher> pub;
+    if (udp) {
+        pub.reset(new m::UdpPublisher(udp_host, udp_port));
+        if (!pub->ok()) { fprintf(stderr, "bad --udp target %s:%u\n", udp_host, udp_port); return 1; }
+        m::UdpPublisher* pp = pub.get();
+        agg.setSnapshotSink([pp](const m::MetricsSnapshot& s){ pp->send(s); });
+        printf("publishing snapshots to udp %s:%u  (start the bridge, open the dashboard)\n",
+               udp_host, udp_port);
+    }
+
     std::thread consumer([&]{ agg.run(); });
 
     // producer: THIS thread parses + drives the book, optionally paced by ITCH time
@@ -155,6 +187,8 @@ int main(int argc, char** argv) {
            n, rp.added(), rp.deleted(), rp.reduced(), rp.replaced());
     printf("metric events   : consumed=%llu  drops=%llu  (book/ladder prices are in cents)\n",
            (unsigned long long)agg.consumed(), (unsigned long long)rec.drops());
+    if (pub) printf("udp datagrams   : sent=%llu errors=%llu\n",
+                    (unsigned long long)pub->sent(), (unsigned long long)pub->errors());
     if (book.getActiveBids() && book.getActiveAsks())
         printf("final book      : best_bid=$%.2f best_ask=$%.2f spread=$%.2f live=%zu\n",
                book.getBestBid()/100.0, book.getBestAsk()/100.0,

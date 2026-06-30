@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Book - Live Latency</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+<style>
+  :root{--bg:#0e1116;--panel:#161b22;--fg:#c9d1d9;--mut:#8b949e;--ok:#3fb950;--bad:#f85149;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;}
+  header{display:flex;align-items:center;gap:18px;padding:10px 16px;background:var(--panel);
+         border-bottom:1px solid #21262d;flex-wrap:wrap;}
+  header h1{font-size:15px;margin:0;font-weight:600;}
+  .stat{display:flex;flex-direction:column;}
+  .stat .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
+  .stat .v{font-size:14px;}
+  #dot{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:6px;}
+  #dot.on{background:var(--ok);}
+  #alertbar{display:flex;flex-wrap:wrap;gap:8px;padding:10px 16px 0;}
+  #alertbar:empty{display:none;}
+  .alert{padding:4px 10px;border-radius:5px;font-size:12px;}
+  .alert.warn{background:#3d2e00;color:#f0c674;border:1px solid #6b5200;}
+  .alert.crit{background:#3d0d0d;color:#ff8a80;border:1px solid #8b1a1a;}
+  .conn{margin-left:auto;display:flex;align-items:center;gap:8px;}
+  main{padding:16px;display:grid;gap:16px;grid-template-columns:1fr 1fr;}
+  .card{background:var(--panel);border:1px solid #21262d;border-radius:8px;padding:12px;}
+  .card h2{font-size:12px;margin:0 0 8px;color:var(--mut);text-transform:uppercase;
+           letter-spacing:.04em;font-weight:600;display:flex;justify-content:space-between;align-items:center;}
+  .wide{grid-column:1 / -1;}
+  select,input{background:#0d1117;color:var(--fg);border:1px solid #30363d;border-radius:5px;
+               padding:3px 6px;font:inherit;}
+  table{width:100%;border-collapse:collapse;}
+  th,td{text-align:right;padding:4px 8px;border-bottom:1px solid #21262d;}
+  th:first-child,td:first-child{text-align:left;}
+  th{color:var(--mut);font-weight:600;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Order Book &middot; Live Latency</h1>
+  <div class="stat"><span class="k">uptime</span><span class="v" id="s-up">&mdash;</span></div>
+  <div class="stat"><span class="k">events/s</span><span class="v" id="s-eps">&mdash;</span></div>
+  <div class="stat"><span class="k">events</span><span class="v" id="s-events">&mdash;</span></div>
+  <div class="stat"><span class="k">drops</span><span class="v" id="s-drops">&mdash;</span></div>
+  <div class="stat"><span class="k">bid</span><span class="v" id="s-bid">&mdash;</span></div>
+  <div class="stat"><span class="k">ask</span><span class="v" id="s-ask">&mdash;</span></div>
+  <div class="stat"><span class="k">spread</span><span class="v" id="s-spread">&mdash;</span></div>
+  <div class="conn">
+    <input id="url" size="22" value="ws://127.0.0.1:8765">
+    <span><span id="dot"></span><span id="conn">disconnected</span></span>
+  </div>
+</header>
+<div id="alertbar"></div>
+<main>
+  <div class="card">
+    <h2>Latency percentiles (ns) <select id="op"></select></h2>
+    <div id="chart-lat"></div>
+  </div>
+  <div class="card">
+    <h2>Throughput (ops/s) by op</h2>
+    <div id="chart-thru"></div>
+  </div>
+  <div class="card wide">
+    <h2>Current snapshot</h2>
+    <table id="tbl">
+      <thead><tr><th>op</th><th>ops/s</th><th>count</th><th>p50</th><th>p99</th><th>p99.9</th><th>max</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+<script>
+(() => {
+  const MAXPTS = 600;                 // ~2 min at 5 Hz
+  const hist = [];                    // recent snapshots
+  const palette = ['#58a6ff','#f85149','#3fb950','#d29922','#bc8cff'];
+  let ops = null, uLat = null, uThru = null, selOp = 0, prev = null;
+
+  const $   = id => document.getElementById(id);
+  const fmtN = v => Math.round(v).toLocaleString();
+  const fmtNs = v => v == null ? '—'
+      : v >= 1e6 ? (v/1e6).toFixed(2)+' ms'
+      : v >= 1e3 ? (v/1e3).toFixed(2)+' µs'
+      : v.toFixed(0)+' ns';
+
+  function mkChart(el, seriesDefs) {
+    const opts = {
+      width: el.clientWidth || 520, height: 240,
+      cursor: { y:false },
+      scales: { x:{ time:false } },
+      axes: [
+        { stroke:'#8b949e', grid:{stroke:'#21262d'}, ticks:{stroke:'#21262d'} },
+        { stroke:'#8b949e', grid:{stroke:'#21262d'}, ticks:{stroke:'#21262d'} },
+      ],
+      series: seriesDefs,
+      legend: { live:true },
+    };
+    const data0 = seriesDefs.map(() => []);   // one empty array per series (x + ys)
+    return new uPlot(opts, data0, el);
+  }
+
+  function buildCharts() {
+    uLat = mkChart($('chart-lat'), [
+      {},
+      { label:'p50',   stroke:palette[0], width:1.5, value:(u,v)=>fmtNs(v) },
+      { label:'p99',   stroke:palette[1], width:1.5, value:(u,v)=>fmtNs(v) },
+      { label:'p99.9', stroke:palette[3], width:1.5, value:(u,v)=>fmtNs(v) },
+    ]);
+    const tseries = [{}];
+    ops.forEach((name,i) => tseries.push(
+      { label:name, stroke:palette[i%palette.length], width:1.5,
+        value:(u,v)=> v==null ? '—' : fmtN(v) }));
+    uThru = mkChart($('chart-thru'), tseries);
+  }
+
+  function refresh() {
+    if (!ops) return;
+    const T = hist.map(s => s.t);
+    const name = ops[selOp];
+    const pick = (s, key) => { const o = s.ops.find(o => o.op === name); return o ? o[key] : null; };
+    uLat.setData([T, hist.map(s=>pick(s,'p50')), hist.map(s=>pick(s,'p99')), hist.map(s=>pick(s,'p999'))]);
+    const tdata = [T];
+    ops.forEach(nm => tdata.push(hist.map(s => { const o = s.ops.find(o=>o.op===nm); return o ? o.ops_s : null; })));
+    uThru.setData(tdata);
+  }
+
+  function updateHeader(s) {
+    $('s-up').textContent = s.t.toFixed(1)+'s';
+    $('s-events').textContent = fmtN(s.events);
+    $('s-drops').textContent = fmtN(s.drops);
+    $('s-eps').textContent = (prev && s.t > prev.t)
+      ? fmtN((s.events - prev.events)/(s.t - prev.t)) : '—';
+    if (s.book) {
+      $('s-bid').textContent = s.book.bid;
+      $('s-ask').textContent = s.book.ask;
+      $('s-spread').textContent = s.book.spread;
+    }
+  }
+
+  function updateTable(s) {
+    $('tbl').querySelector('tbody').innerHTML = s.ops.map(o =>
+      '<tr><td>'+o.op+'</td><td>'+fmtN(o.ops_s)+'</td><td>'+fmtN(o.count)+'</td>'+
+      '<td>'+fmtNs(o.p50)+'</td><td>'+fmtNs(o.p99)+'</td><td>'+fmtNs(o.p999)+'</td><td>'+fmtNs(o.max)+'</td></tr>'
+    ).join('');
+  }
+
+  function renderAlerts(alerts) {
+    $('alertbar').innerHTML = (alerts || []).map(a => {
+      const crit = a.level === 'crit';
+      return '<span class="alert '+(crit?'crit':'warn')+'">'+(crit?'● ':'▲ ')+a.text+'</span>';
+    }).join('');
+  }
+
+  function onSnap(s) {
+    if (s.final) return;              // skip the empty shutdown-flush frame
+    if (!ops) {
+      ops = s.ops.map(o => o.op);
+      const sel = $('op');
+      sel.innerHTML = ops.map((n,i) => '<option value="'+i+'">'+n+'</option>').join('');
+      sel.onchange = e => { selOp = +e.target.value; refresh(); };
+      buildCharts();
+    }
+    hist.push(s); if (hist.length > MAXPTS) hist.shift();
+    updateHeader(s); updateTable(s); renderAlerts(s.alerts); refresh();
+    prev = s;
+  }
+
+  let ws = null;
+  function setConn(on) {
+    $('dot').classList.toggle('on', on);
+    $('conn').textContent = on ? 'connected' : 'disconnected';
+  }
+  function connect() {
+    const url = $('url').value.trim();
+    try { ws = new WebSocket(url); }
+    catch (e) { setConn(false); setTimeout(connect, 1000); return; }
+    ws.onopen    = () => setConn(true);
+    ws.onclose   = () => { setConn(false); setTimeout(connect, 1000); };
+    ws.onerror   = () => { try { ws.close(); } catch (e) {} };
+    ws.onmessage = e => { try { onSnap(JSON.parse(e.data)); } catch (err) {} };
+  }
+  $('url').onchange = () => { if (ws) try { ws.close(); } catch (e) {} };  // reconnect on edit
+
+  window.addEventListener('resize', () => {
+    if (uLat)  uLat.setSize({ width: $('chart-lat').clientWidth,  height:240 });
+    if (uThru) uThru.setSize({ width: $('chart-thru').clientWidth, height:240 });
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

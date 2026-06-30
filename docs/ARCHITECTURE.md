@@ -303,13 +303,13 @@ max, in ns) and fanned out: the console "top" view is one consumer, an optional 
         writeJson() -> NDJSON        UdpPublisher::send()
         json_snapshot_demo           writeJson() -> sendto() ONE datagram
         (one JSON line / cycle)      udp_publish_demo -> 127.0.0.1:9099
-                                              │  fire-and-forget UDP
-                                              |
-                                          Python UDP
-                                              |
-                                          WebSocket bridge
-                                              |
-                                          uPlot dashboard
+                                              │  fire-and-forget UDP datagram
+                                              v
+                                  dashboard/udp_ws_bridge.py  (asyncio + websockets)
+                                  UDP :9099  ->  ws://127.0.0.1:8765
+                                              │  one snapshot -> one WS text frame
+                                              v
+                                  dashboard/index.html (uPlot, browser)
 ```
 
 Design notes:
@@ -319,5 +319,22 @@ Design notes:
   cadence; the producer never serializes and never touches a socket.
 - **One snapshot == one UDP datagram.** `writeJson()` stays well under an MTU (~600-800 B with five
   op rows), so there is no framing to reassemble; a lost datagram just skips a dashboard frame.
+- **The bridge is a stateless relay.** `dashboard/udp_ws_bridge.py` (asyncio + `websockets`) receives
+  each datagram on UDP :9099 and `broadcast()`s it unchanged as a WebSocket text frame to every client
+  on `ws://127.0.0.1:8765` — browsers cannot read UDP, so this is the only glue to the page; a slow
+  client is simply dropped.
+- **The dashboard is a thin consumer.** `dashboard/index.html` (uPlot from a CDN, no build step) opens
+  the WebSocket, `JSON.parse`s each frame, skips the `final` flush frame, and plots per-op p50/p99/p99.9
+  over time + throughput by op, with a live header and a current-snapshot table. It reads the same
+  numbers the console "top" view does, so the two can never disagree.
 
-<to_be_continued>
+Built: hot path · ring · aggregator · console view · snapshot JSON · UDP publisher ·
+Python UDP->WebSocket bridge · uPlot browser dashboard. The full chain runs end to end:
+  engine -> aggregator -> writeJson -> UDP :9099 -> udp_ws_bridge.py -> ws://:8765 -> browser.
+`udp_publish_demo` keeps the console on while publishing, so the console and browser show the same
+snapshot at once. Next: book-depth ladder + trade tape, alert rules inside the aggregator,
+NDJSON logging + historical playback.
+
+   Web layer (dashboard/):
+     udp_ws_bridge.py   Python asyncio relay: UDP datagrams -> WebSocket text frames
+     index.html         single-file uPlot dashboard (charts + header + table)

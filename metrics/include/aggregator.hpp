@@ -16,6 +16,7 @@
 #include "metrics_event.hpp"
 #include "latency_histogram.hpp"
 #include "metrics_snapshot.hpp"             // json snapshot serialization
+#include "metrics_alerts.hpp"               // operational alert rules
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -47,6 +48,8 @@ public:
     // off the hot path (Core B, ~render_hz). The NDJSON logger / UDP publisher attach here..
     void setSnapshotSink(std::function<void(const MetricsSnapshot&)> s) { sink_ = std::move(s); }
     void setConsole(bool on) { console_ = on; }
+    // Configure the operational alert thresholds (evaluated each render cycle).
+    void setAlerts(const AlertConfig& c) { alert_cfg_ = c; }
 
     // Blocking drain+render loop. Runs until stop(); on exit it drains whatever
     // remains and paints a final frame so no tail events are lost.
@@ -170,7 +173,12 @@ private:
             win_[op].reset();                         // start a fresh window
         }
 
+        evaluateAlerts(snap, alert_cfg_, last_drops_alert_);   // operational rules -> snap.alerts
+
         if (console_) {
+            for (uint32_t i = 0; i < snap.num_alerts; ++i)
+                n += snprintf(buf + n, sizeof(buf) - n, "  ALERT [%s] %s\n",
+                              snap.alerts[i].level, snap.alerts[i].text);
             if (use_ansi_) n += snprintf(buf + n, sizeof(buf) - n, "\033[J");  // clear below
             fwrite(buf, 1, (size_t)n, stdout);
             fflush(stdout);
@@ -223,6 +231,8 @@ private:
     bool     use_ansi_;
     bool     console_ = true;
     std::function<void(const MetricsSnapshot&)> sink_;
+    AlertConfig alert_cfg_;             // operational alert thresholds
+    uint64_t    last_drops_alert_ = 0;  // for the drops-delta rule
 
     std::atomic<bool> running_{true};
 
