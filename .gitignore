@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Build directories
 build/
 out/
@@ -10,7 +9,6 @@ build-metrics/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-Makefile
 *.cmake
 
 # Compiled objects
@@ -37,7 +35,14 @@ itch_perf2.data*
 # Data files
 data/*.itch
 data/*.pcap
-EOF
 
 # json
 session.ndjson*
+
+# FPGA simulation artifacts (cocotb / Icarus)
+fpga/sim_build/
+fpga/results.xml
+fpga/*.vcd
+fpga/*.fst
+__pycache__/
+#fpga/Makefile
