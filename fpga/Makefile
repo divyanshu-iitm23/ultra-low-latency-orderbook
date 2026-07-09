@@ -1,16 +1,27 @@
-# fpga/Makefile - cocotb + Icarus Verilog simulation entry point...
+# fpga/Makefile - cocotb + Icarus Verilog simulation entry point.
 #
+#   make               simulate the default DUT (itch_parser)
+#   make DUT=axis_reg  simulate another block
+#   make regress       run every testbench
+#   make waves         open the DUT's dump in gtkwave
 
 SIM           ?= icarus
 TOPLEVEL_LANG ?= verilog
 
-VERILOG_SOURCES     = $(CURDIR)/rtl/axis_reg.v
-COCOTB_TOPLEVEL     = axis_reg
-COCOTB_TEST_MODULES = test_axis_reg
+DUT ?= itch_parser
+
+VERILOG_SOURCES     = $(CURDIR)/rtl/$(DUT).v
+COCOTB_TOPLEVEL     = $(DUT)
+COCOTB_TEST_MODULES = test_$(DUT)
+SIM_BUILD           = sim_build/$(DUT)
 
 export PYTHONPATH := $(CURDIR)/tb:$(PYTHONPATH)
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
+regress:
+	$(MAKE) DUT=axis_reg
+	$(MAKE) DUT=itch_parser
+
 waves:
-	gtkwave axis_reg.vcd &
+	gtkwave $(DUT).vcd &

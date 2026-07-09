@@ -12,7 +12,7 @@
 
 namespace itch {
 
-// --- big-endian field readers (network byte order) ---
+// big-endian field readers (network byte order)
 inline uint16_t rdU16(const uint8_t* p) { return (uint16_t(p[0]) << 8) | p[1]; }
 inline uint32_t rdU32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
