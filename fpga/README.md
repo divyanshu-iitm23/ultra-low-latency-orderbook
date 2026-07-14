@@ -20,6 +20,14 @@ PHASE 3: FPGA UDP Packet PARSER (Hardware)
 │   └──  golden-model scoreboard vs the Phase-1 C++ parser — random + real capture
 │
 ├── 3: Wire-format front-end — MoldUDP64 / UDP / IP / Ethernet
+|   |
+│   ├──  3.0  frames.py — wire-frame builder + reference unwrap (stimulus)                  [done]
+│   ├──  3.1  axis_skip_align.v — the gearbox: drop N leading bytes, realign to lane 0      [done]
+│   ├──  3.2  eth_parser.v      — strip 14 B (+4 VLAN), filter ethertype 0x0800
+│   ├──  3.3  ipv4_parser.v     — IHL skip, proto==17, trim to total_length, checksum
+│   ├──  3.4  udp_parser.v      — strip 8 B, port filter, trim to UDP length
+│   ├──  3.5  mold_parser.v     — strip 20 B, sequence-gap strobe, heartbeat / end-of-session
+│   └──  3.6  feed_top.v        — eth → ipv4 → udp → mold → itch_parser (unmodified)
 │
 └── 4: FPGA vs software comparison
     |
@@ -40,10 +48,14 @@ fpga/
 ├── Makefile               cocotb entry point (SIM=icarus, DUT-parametrized)
 ├── rtl/                   Verilog sources (the DUTs)
 │   ├── axis_reg.v         AXI-Stream register slice (skid buffer) — first block
+│   ├── axis_skip_align.v  the gearbox: skip N bytes, realign to lane 0
 │   └── itch_parser.v      streaming ITCH 5.0 message parser
 ├── tb/                    cocotb testbenches (Python)
 │   ├── test_axis_reg.py
-│   └── test_itch_parser.py
+│   ├── test_axis_skip_align.py
+│   ├── test_itch_parser.py
+│   ├── frames.py          wire-frame builder + reference unwrap (step-3 stimulus)
+│   └── test_frames.py     self-test for frames.py (pure Python, no simulator)
 └── tools/
     └── itch_dump.cpp      golden-model dump (wraps the Phase-1 include/itch_parser.hpp)
 ```
@@ -101,6 +113,111 @@ completion lane — not after the lane loop. The symptom (type byte showed the
 NEXT message's type while timestamp/ref were correct) appeared on both random
 and real data.
 
+## Step 3 — the wire-format front-end
+
+Each subpart below records **why it has to exist** (requirement) and **how it
+works**, added as it is built.
+
+### 3.0 · frames.py — the wire-frame builder
+
+**Requirement.** The capture files hold the offline BinaryFILE format —
+`[2B BE len][body]…` with no network wrapper. Real wire frames do not exist
+anywhere in this project, so before a single line of front-end RTL can be
+tested, something has to *manufacture* them — and independently say what each
+layer owes its downstream. That is stimulus and ground truth in one file, which
+is why it is built first: a bug here would be "verified" straight into the
+hardware.
+
+**Working.** On a real feed the length-prefixed blocks arrive buried under four
+layers of headers:
+
+```
+byte  0        14          34      42              62
+      ├────────┼───────────┼───────┼───────────────┼──────────────────┐
+      │Ethernet│   IPv4    │  UDP  │  MoldUDP64    │ [len][msg][len][msg]…
+      │  14 B  │  20 B(*)  │  8 B  │     20 B      │  <-- what itch_parser.v parses
+      └────────┴───────────┴───────┴───────────────┴──────────────────┘
+       ethertype ver/IHL      dport  session(10)
+       =0x0800   proto=17     length seq(8) count(2)
+```
+
+MoldUDP64's payload is *exactly* the length-prefixed framing the RTL parser
+already consumes, so the front-end never touches `itch_parser.v` — it strips 62
+bytes and hands over the rest. `frames.py` builds those frames (`wire_frame`,
+`packetize`) and provides the reference unwrap (`unwrap_frame`) that tells each
+RTL layer what it owes its downstream.
+
+`test_frames.py` (17 tests, pure Python — no simulator) covers— **wrap → unwrap must return exactly the byte stream
+`itch_parser.v` already parses**, on synthetic *and* real capture messages —
+plus header field placement, a valid IPv4 checksum, VLAN tags, IP options,
+Mold heartbeats / end-of-session, sequence-number advance (the basis for gap
+detection), and the four frames that must be dropped (wrong ethertype, wrong
+protocol, wrong port, bad checksum).
+
+**A finding from writing it:** Ethernet padding, which the plan listed as a
+hazard, *cannot occur on this feed*. The smallest possible datagram is a Mold
+heartbeat — 20 (mold) + 8 (UDP) + 20 (IPv4) = **48 bytes**, already above
+Ethernet's 46-byte minimum payload. The RTL still trims to IPv4 `total_length`
+(that is the generally-correct bound, and the test proves the trim path works),
+but the padding case is dead code for this protocol stack. A test asserts the
+48-byte floor so a future framing change trips it loudly.
+
+Note the payload begins at **byte 62 — lane 6 of beat 7** on a 64-bit datapath.
+Nothing downstream is 8-byte aligned, which is exactly the problem the gearbox
+(3.1) exists to solve.
+
+### 3.1 · axis_skip_align.v — the gearbox
+
+**Requirement.** Every protocol layer needs the same operation: discard a
+*runtime-variable* number of leading bytes, then hand the rest downstream —
+starting at lane 0. The byte counts are not known at compile time (IPv4's IHL
+makes its header 20–60 B; a VLAN tag adds 4 B to Ethernet), and after any skip
+that is not a multiple of 8 the payload is misaligned inside the 64-bit beats.
+With the real 62-byte header stack the payload starts at **lane 6 of beat 7**.
+Written once, generically, `eth`/`ipv4`/`udp`/`mold` all become thin wrappers
+around it — written four times, it would be the same bug four times.
+
+**Working.** A byte-oriented staging buffer, two beats (16 B) wide.
+
+```
+  skip=3     in  |a a a b b b b b|   |b b c c . . . .|
+  (drop 'a')     └───skip──┘                              staging buffer
+                 out |b b b b b b b c|  |c . . . . . . .| tlast
+                      └── aligned to lane 0 ──┘
+```
+
+Each input beat appends its post-skip bytes to the buffer; whenever ≥ 8 bytes
+are staged, one fully-aligned beat is emitted and the **residue carries into the
+next beat — that carry *is* the realignment**. Backpressure works by only
+accepting an input beat when the buffer has room for a whole beat, so a
+downstream stall propagates upstream in one cycle.
+
+Three control inputs, sampled on the frame's first beat and held by the layer
+above (which has already seen the header bytes it needs):
+
+| Input | Meaning |
+|---|---|
+| `skip` | leading bytes to discard |
+| `keep_len` | payload bytes to emit after the skip; `0` = to end of frame. This is how IPv4 `total_length` bounds the payload. |
+| `drop` | filter reject — emit nothing at all |
+
+The whole contract is one line of Python, and that is literally the testbench's
+reference model:
+
+```python
+out = b"" if drop else frame[skip : skip + keep_len]
+```
+
+**A design bug the tests caught.** The first version inferred end-of-frame from
+the input's `tlast`. But when `keep_len` truncates the payload, the last output
+beat is emitted *before* the input frame ends — so `tlast` never fired and the
+sink waited forever (the test hung, rather than failing). The fix is to track
+"no more payload bytes can arrive" explicitly (`done_q`, set when the `keep_len`
+budget is spent **or** the input ends) and assert `tlast` on whichever output
+beat empties the buffer once it holds. Truncation and frame-end are genuinely
+different events; conflating them is what broke it.
+
+
 ## Toolchain
 
 | Tool | Role | Install |
@@ -120,10 +237,12 @@ pip install cocotb cocotbext-axi pytest
 ```sh
 source ~/.venvs/fpga/bin/activate
 
-make               # default DUT: itch_parser (random-traffic + real-capture tests)
-make DUT=axis_reg  # the skid-buffer block instead (used for testing)
-make regress       # every testbench
-make waves         # open the DUT's VCD dump in gtkwave
+make                     # default DUT: itch_parser (random-traffic + real-capture tests)
+make DUT=axis_reg        # the skid-buffer block instead (used for testing)
+make DUT=axis_skip_align # the gearbox (3.1)
+make pytests             # pure-Python testbench helpers (frames.py) - no simulator
+make regress             # every testbench: pytests + each RTL block
+make waves               # open the DUT's VCD dump in gtkwave
 
 # point the real-capture test at any BinaryFILE-format .ITCH50 file
 ITCH_FILE=~/market-data/sample_50mb.ITCH50 make

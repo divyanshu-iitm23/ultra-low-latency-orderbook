@@ -2,6 +2,7 @@
 #
 #   make               simulate the default DUT (itch_parser)
 #   make DUT=axis_reg  simulate another block
+#   make pytests       pure-Python testbench helpers (no simulator)
 #   make regress       run every testbench
 #   make waves         open the DUT's dump in gtkwave
 
@@ -19,8 +20,14 @@ export PYTHONPATH := $(CURDIR)/tb:$(PYTHONPATH)
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-regress:
+# frames.py is stimulus AND ground truth for the step-3 blocks, so it is tested
+# on its own -- a bug there would be "verified" straight into the hardware
+pytests:
+	cd $(CURDIR)/tb && python -m pytest -q test_frames.py
+
+regress: pytests
 	$(MAKE) DUT=axis_reg
+	$(MAKE) DUT=axis_skip_align
 	$(MAKE) DUT=itch_parser
 
 waves:
