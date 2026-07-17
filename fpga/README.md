@@ -1,4 +1,4 @@
-# Phase 3 — FPGA UDP Packet Parser
+# Phase 3 - FPGA UDP Packet Parser
 
 Hardware study: a streaming Verilog parser for the Nasdaq feed, verified in
 simulation against the Phase-1 C++ parser.
@@ -23,8 +23,8 @@ PHASE 3: FPGA UDP Packet PARSER (Hardware)
 |   |
 │   ├──  3.0  frames.py — wire-frame builder + reference unwrap (stimulus)                  [done]
 │   ├──  3.1  axis_skip_align.v — the gearbox: drop N leading bytes, realign to lane 0      [done]
-│   ├──  3.2  eth_parser.v      — strip 14 B (+4 VLAN), filter ethertype 0x0800
-│   ├──  3.3  ipv4_parser.v     — IHL skip, proto==17, trim to total_length, checksum
+│   ├──  3.2  eth_parser.v      — strip 14 B (+4 VLAN), filter ethertype 0x0800            [done]
+│   ├──  3.3  ipv4_parser.v     — IHL skip, proto==17, trim to total_length, checksum      [done]
 │   ├──  3.4  udp_parser.v      — strip 8 B, port filter, trim to UDP length
 │   ├──  3.5  mold_parser.v     — strip 20 B, sequence-gap strobe, heartbeat / end-of-session
 │   └──  3.6  feed_top.v        — eth → ipv4 → udp → mold → itch_parser (unmodified)
@@ -48,11 +48,15 @@ fpga/
 ├── Makefile               cocotb entry point (SIM=icarus, DUT-parametrized)
 ├── rtl/                   Verilog sources (the DUTs)
 │   ├── axis_reg.v         AXI-Stream register slice (skid buffer) — first block
-│   ├── axis_skip_align.v  the gearbox: skip N bytes, realign to lane 0
+│   ├── axis_skip_align.v  the gearbox: skip N bytes, realign to lane 0 (3.1)
+│   ├── eth_parser.v       Ethernet layer: sniff ethertype, strip 14/18 B (3.2)
+│   ├── ipv4_parser.v      IPv4 layer: IHL skip, proto/checksum, trim to total_length (3.3)
 │   └── itch_parser.v      streaming ITCH 5.0 message parser
 ├── tb/                    cocotb testbenches (Python)
 │   ├── test_axis_reg.py
 │   ├── test_axis_skip_align.py
+│   ├── test_eth_parser.py
+│   ├── test_ipv4_parser.py
 │   ├── test_itch_parser.py
 │   ├── frames.py          wire-frame builder + reference unwrap (step-3 stimulus)
 │   └── test_frames.py     self-test for frames.py (pure Python, no simulator)
@@ -113,12 +117,12 @@ completion lane — not after the lane loop. The symptom (type byte showed the
 NEXT message's type while timestamp/ref were correct) appeared on both random
 and real data.
 
-## Step 3 — the wire-format front-end
+## Step 3 - the wire-format front-end
 
 Each subpart below records **why it has to exist** (requirement) and **how it
 works**, added as it is built.
 
-### 3.0 · frames.py — the wire-frame builder
+### 3.0  frames.py - the wire-frame builder
 
 **Requirement.** The capture files hold the offline BinaryFILE format —
 `[2B BE len][body]…` with no network wrapper. Real wire frames do not exist
@@ -166,7 +170,7 @@ Note the payload begins at **byte 62 — lane 6 of beat 7** on a 64-bit datapath
 Nothing downstream is 8-byte aligned, which is exactly the problem the gearbox
 (3.1) exists to solve.
 
-### 3.1 · axis_skip_align.v — the gearbox
+### 3.1  axis_skip_align.v - we'll call it gearbox from now
 
 **Requirement.** Every protocol layer needs the same operation: discard a
 *runtime-variable* number of leading bytes, then hand the rest downstream —
@@ -181,7 +185,7 @@ around it — written four times, it would be the same bug four times.
 
 ```
   skip=3     in  |a a a b b b b b|   |b b c c . . . .|
-  (drop 'a')     └───skip──┘                              staging buffer
+  (drop 'a')     └skip─┘                              staging buffer
                  out |b b b b b b b c|  |c . . . . . . .| tlast
                       └── aligned to lane 0 ──┘
 ```
@@ -217,6 +221,97 @@ budget is spent **or** the input ends) and assert `tlast` on whichever output
 beat empties the buffer once it holds. Truncation and frame-end are genuinely
 different events; conflating them is what broke it.
 
+### 3.2  eth_parser.v - the Ethernet layer
+
+**Requirement.** This is the first block that *reads header bytes and makes a
+decision*, instead of being told what to do. Everything before it was blind:
+the gearbox obeys a `skip` it is handed. `eth_parser` has to produce that
+number itself, and it has two decisions to make:
+
+- **how many bytes to strip** — 14 for a plain Ethernet II frame, but **18** if
+  an 802.1Q VLAN tag is present. A tag shows up as ethertype `0x8100` at bytes
+  12–13, which pushes the *real* ethertype out to bytes 16–17 and grows the
+  header by 4. The strip length is therefore data-dependent, not a constant.
+- **whether to keep the frame at all** — the (post-VLAN) ethertype must be
+  `0x0800` (IPv4). ARP, IPv6, anything else → drop, emit nothing.
+
+**Working.** It is a thin lookahead FSM wrapped around one `axis_skip_align`
+instance — the payoff of building the gearbox first. `eth_parser` decides
+`skip` and `drop`; the gearbox does the actual byte-moving. Ethernet does not
+trim a tail, so `keep_len = 0` (to end of frame); IPv4 `total_length` handles
+trimming one layer up.
+
+```
+  wire frame ─► [ eth_parser ]──────────────────────► IPv4 packet
+                   │ sniff bytes 12-13 (+16-17 if VLAN tag)
+                   │ decide  skip = 14 or 18
+                   │         drop = (ethertype != 0x0800)
+                   └─► axis_skip_align does the stripping
+```
+
+**The wrinkle, and how it is handled.** The gearbox samples `skip`/`drop` on the
+*first beat* of a frame — but on a 64-bit datapath the ethertype at byte 12 is
+in **beat 1**, and the VLAN's real ethertype at byte 16 is in **beat 2**. The
+decision simply is not available when the gearbox would want it. So `eth_parser`
+*holds* the opening beats (`S_SNIFF`) while it reads the ethertype, resolves
+`skip`/`drop`, then (`S_EMIT`) replays the held beats into the gearbox with the
+control word already correct and streams the rest through live. It holds two
+beats for a plain frame, three for a VLAN frame — and a runt frame that ends
+inside the header is simply dropped. The input stalls for those few cycles per
+frame while the held beats drain; the layer is not zero-bubble, but it is
+honestly streaming (not store-and-forward), and the small per-frame bubble is a
+fair thing to quantify in step 4.
+
+Five tests, all green, checked against `frames.unwrap_eth()`: plain IPv4;
+VLAN-tagged (strip 18); ARP/IPv6 dropped, tagged and untagged; a mixed
+back-to-back stream with stutter and backpressure; and real capture frames from
+`frames.py`. Because the DUT has no control inputs, the reference is entirely
+"what should the header say" — the test never tells it the skip, it only checks
+the payload.
+
+### 3.3  ipv4_parser.v - the IPv4 layer    [done]
+
+**Requirement.** The richest of the protocol layers: four decisions, all read
+out of the IP header, and the first layer to use *every* gearbox control.
+
+- **Variable-length skip.** The low nibble of byte 0 is IHL, the header length
+  in 32-bit words; `skip = IHL*4` — 20 bytes normally, up to 60 with IP options.
+  This is the reason the gearbox takes a runtime `skip` rather than a constant.
+- **Protocol filter.** Byte 9 must be 17 (UDP); TCP/ICMP/anything else → drop.
+- **Trim to total_length.** Bytes 2–3 are header+payload length. The payload is
+  `total_length - IHL*4` bytes, and that becomes the gearbox `keep_len` — the
+  first layer that actually uses it. This is what would strip trailing Ethernet
+  padding (harmless on this feed, but the correct bound).
+- **Header checksum.** The 16-bit one's-complement sum over the header words must
+  fold to `0xFFFF`; a corrupt header → drop.
+
+**Working.** Same hold-and-replay FSM around one `axis_skip_align`, but with more
+to resolve during the hold. The catch specific to this layer: the checksum is
+not known until the **whole header** has been summed, and how many beats that
+spans depends on IHL itself (3 beats for a 20-byte header, up to 8 for a 60-byte
+one). So the checksum is accumulated **incrementally, beat by beat**, during
+`S_SNIFF` — each header beat contributes its 16-bit words to a running sum — and
+only when the last header byte has been folded in is `drop` decided. Because
+that all happens before `S_EMIT`, the drop decision is settled before the first
+payload byte ever reaches the gearbox.
+
+```
+  IP packet ─► [ ipv4_parser ]─────────────────────────► UDP segment
+                  │ beat 0 : version, IHL (→ skip), total_length
+                  │ beat 1 : protocol (byte 9)
+                  │ beats 0..N : accumulate header checksum
+                  │ resolve: skip=IHL*4  keep_len=total-IHL*4
+                  │          drop = !v4 | IHL<5 | proto!=17 | !csum | ...
+                  └─► axis_skip_align strips + trims
+```
+
+Six tests, checked against `frames.unwrap_ipv4()`: plain UDP packets; variable
+IHL with options (5–15 words); `total_length` trimming of trailing bytes;
+rejects for wrong protocol, bad checksum, and wrong version; a mixed stream with
+stutter and backpressure; and real capture packets. The checksum accumulation is
+the one genuinely new sub-capability in step 3 — everything after this (UDP,
+Mold) is a simplification of this block.
+
 
 ## Toolchain
 
@@ -240,6 +335,8 @@ source ~/.venvs/fpga/bin/activate
 make                     # default DUT: itch_parser (random-traffic + real-capture tests)
 make DUT=axis_reg        # the skid-buffer block instead (used for testing)
 make DUT=axis_skip_align # the gearbox (3.1)
+make DUT=eth_parser      # the Ethernet layer (3.2)
+make DUT=ipv4_parser     # the IPv4 layer (3.3)
 make pytests             # pure-Python testbench helpers (frames.py) - no simulator
 make regress             # every testbench: pytests + each RTL block
 make waves               # open the DUT's VCD dump in gtkwave

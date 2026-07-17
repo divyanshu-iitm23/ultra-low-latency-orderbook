@@ -11,7 +11,12 @@ TOPLEVEL_LANG ?= verilog
 
 DUT ?= itch_parser
 
-VERILOG_SOURCES     = $(CURDIR)/rtl/$(DUT).v
+# blocks that instantiate other modules list them here (space-separated)
+DEPS_eth_parser  = axis_skip_align
+DEPS_ipv4_parser = axis_skip_align
+
+VERILOG_SOURCES     = $(CURDIR)/rtl/$(DUT).v \
+                      $(foreach d,$(DEPS_$(DUT)),$(CURDIR)/rtl/$(d).v)
 COCOTB_TOPLEVEL     = $(DUT)
 COCOTB_TEST_MODULES = test_$(DUT)
 SIM_BUILD           = sim_build/$(DUT)
@@ -28,6 +33,8 @@ pytests:
 regress: pytests
 	$(MAKE) DUT=axis_reg
 	$(MAKE) DUT=axis_skip_align
+	$(MAKE) DUT=eth_parser
+	$(MAKE) DUT=ipv4_parser
 	$(MAKE) DUT=itch_parser
 
 waves:
