@@ -25,8 +25,8 @@ PHASE 3: FPGA UDP Packet PARSER (Hardware)
 │   ├──  3.1  axis_skip_align.v — the gearbox: drop N leading bytes, realign to lane 0      [done]
 │   ├──  3.2  eth_parser.v      — strip 14 B (+4 VLAN), filter ethertype 0x0800            [done]
 │   ├──  3.3  ipv4_parser.v     — IHL skip, proto==17, trim to total_length, checksum      [done]
-│   ├──  3.4  udp_parser.v      — strip 8 B, port filter, trim to UDP length
-│   ├──  3.5  mold_parser.v     — strip 20 B, sequence-gap strobe, heartbeat / end-of-session
+│   ├──  3.4  udp_parser.v      — strip 8 B, port filter, trim to UDP length              [done]
+│   ├──  3.5  mold_parser.v     — strip 20 B, sequence-gap strobe, heartbeat / end-of-session [done]
 │   └──  3.6  feed_top.v        — eth → ipv4 → udp → mold → itch_parser (unmodified)
 │
 └── 4: FPGA vs software comparison
@@ -51,12 +51,16 @@ fpga/
 │   ├── axis_skip_align.v  the gearbox: skip N bytes, realign to lane 0 (3.1)
 │   ├── eth_parser.v       Ethernet layer: sniff ethertype, strip 14/18 B (3.2)
 │   ├── ipv4_parser.v      IPv4 layer: IHL skip, proto/checksum, trim to total_length (3.3)
+│   ├── udp_parser.v       UDP layer: strip 8 B, port filter, trim to length (3.4)
+│   ├── mold_parser.v      MoldUDP64: strip 20 B, seq-gap strobe, heartbeat/EOS (3.5)
 │   └── itch_parser.v      streaming ITCH 5.0 message parser
 ├── tb/                    cocotb testbenches (Python)
 │   ├── test_axis_reg.py
 │   ├── test_axis_skip_align.py
 │   ├── test_eth_parser.py
 │   ├── test_ipv4_parser.py
+│   ├── test_udp_parser.py
+│   ├── test_mold_parser.py
 │   ├── test_itch_parser.py
 │   ├── frames.py          wire-frame builder + reference unwrap (step-3 stimulus)
 │   └── test_frames.py     self-test for frames.py (pure Python, no simulator)
@@ -262,7 +266,7 @@ frame while the held beats drain; the layer is not zero-bubble, but it is
 honestly streaming (not store-and-forward), and the small per-frame bubble is a
 fair thing to quantify in step 4.
 
-Five tests, all green, checked against `frames.unwrap_eth()`: plain IPv4;
+Five tests, checked against `frames.unwrap_eth()`: plain IPv4;
 VLAN-tagged (strip 18); ARP/IPv6 dropped, tagged and untagged; a mixed
 back-to-back stream with stutter and backpressure; and real capture frames from
 `frames.py`. Because the DUT has no control inputs, the reference is entirely
@@ -271,8 +275,7 @@ the payload.
 
 ### 3.3  ipv4_parser.v - the IPv4 layer    [done]
 
-**Requirement.** The richest of the protocol layers: four decisions, all read
-out of the IP header, and the first layer to use *every* gearbox control.
+**Requirement.** four decisions, all read out of the IP header, and the first layer to use *every* gearbox control.
 
 - **Variable-length skip.** The low nibble of byte 0 is IHL, the header length
   in 32-bit words; `skip = IHL*4` — 20 bytes normally, up to 60 with IP options.
@@ -312,6 +315,90 @@ stutter and backpressure; and real capture packets. The checksum accumulation is
 the one genuinely new sub-capability in step 3 — everything after this (UDP,
 Mold) is a simplification of this block.
 
+### 3.4 udp_parser.v - the UDP layer    [done]
+
+**Requirement.** Three tasks: strip the fixed 8-byte header,
+filter on the destination port (bytes 2–3 must be the feed port), and trim to
+the UDP length field (bytes 4–5) so the payload is `length - 8` bytes. No
+variable-length header, no checksum — a strict simplification of IPv4.
+
+**Working.** This is the thinnest layer in the stack: **no FSM, no hold buffer, no state of its
+own** — just a combinational header decode wired straight into one
+`axis_skip_align`.
+
+That is possible here and nowhere else, because **every field this layer needs
+lives in beat 0** (bytes 0–7), so the control word is already valid on the very
+beat the gearbox samples it. Contrast the layers above:
+
+| Layer | Deciding field | Lookahead needed |
+|---|---|---|
+| `eth_parser` | ethertype at byte 12 (or 16 behind a VLAN tag) | hold 2–3 beats |
+| `ipv4_parser` | checksum — the whole 20–60 B header | hold 3–8 beats |
+| `udp_parser` | port + length, both by byte 5 | **none** |
+
+So it is also the only layer with **zero per-frame bubbles**. The decode is
+garbage on every beat except beat 0 (it is just reading payload bytes by then),
+which is harmless: the gearbox latches `skip`/`keep_len`/`drop` on the first
+beat of a frame and ignores the inputs afterwards.
+
+One deliberate choice: a segment whose `length <= 8` (header only, no payload)
+is dropped rather than passed with `keep_len = 0`.
+
+Six tests against `frames.unwrap_udp()`: plain segments (payloads 1–300 bytes),
+wrong-port drops, UDP-length trimming of trailing bytes, runts and empty
+payloads, a mixed stream with stutter and backpressure, and real capture
+segments.
+
+### 3.5 mold_parser.v — the MoldUDP64 layer    [done]
+
+**Requirement.** The last strip before the ITCH parser, and the only layer that
+carries **state across datagrams**.
+
+```
+  session(10) │ sequence(8) │ count(2) │ [2B len][msg][2B len][msg]…
+  └──────── 20-byte header ───────────┘ └── exactly what itch_parser.v takes ──┘
+```
+
+- **Strip the fixed 20-byte header.** The payload is the rest of the datagram
+  (UDP already trimmed it to its length field), so `keep_len = 0`.
+- **Emit nothing for datagrams carrying no messages** — a *heartbeat*
+  (`count == 0`) or *end-of-session* (`count == 0xFFFF`).
+- **Detect sequence gaps.** `sequence` is the seq of the *first* message in the
+  packet, so the next packet should start at `seq + count`. A mismatch means
+  datagrams were lost on the wire. This is the hardware echo of the Phase-2
+  `drops` alert — and because messages never span datagrams, a gap loses whole
+  messages and the ITCH parser downstream never desyncs.
+
+**Working.** Structurally it is `eth_parser` again — hold the opening beats,
+resolve, replay into one `axis_skip_align`. It holds **three** beats because
+`sequence` **straddles a beat boundary**: bytes 10–15 land in beat 1 and bytes
+16–17 in beat 2, with `count` at bytes 18–19 also in beat 2. So beat 1 stashes
+the high 6 bytes and beat 2 stitches on the low 2 — the first header field in
+this project that is split across beats.
+
+The gap detector is the only cross-datagram state: an `expected_seq` register
+plus a `have_expect` flag (so the first packet after reset just initialises
+rather than false-firing). On a gap it strobes **and resyncs** to `seq + count`,
+so one lost burst produces one strobe rather than an endless stream of them.
+End-of-session advances nothing — `0xFFFF` is a marker, not 65535 messages —
+while a heartbeat legitimately advances by its `count` of 0, meaning it
+re-states the next expected seq without moving it.
+
+Beyond the stream ports it exposes `hdr_valid` (a strobe per decoded header),
+`pkt_seq`, `pkt_count`, and `seq_gap`. Session id is deliberately passed over
+unchecked: the reference does not filter on it either (single-session feed), and
+an unfilterable output would be untested code. A multi-session deployment would
+compare it here.
+
+Eight tests, all green: header stripping; field decode across the beat boundary
+(including a 64-bit seq like `0x123456789ABCDEF0`); heartbeat and end-of-session
+emitting nothing while still decoding their headers; **gap detection with
+resync**; a heartbeat correctly *not* advancing expectation; runts; a mixed
+stream with stutter and backpressure; and real capture datagrams — where the
+concatenated payloads must rebuild **exactly the BinaryFILE stream
+`itch_parser.v` already parses**, with zero gaps flagged on in-order data. That
+last test is the whole front-end's thesis in one assertion.
+
 
 ## Toolchain
 
@@ -337,6 +424,8 @@ make DUT=axis_reg        # the skid-buffer block instead (used for testing)
 make DUT=axis_skip_align # the gearbox (3.1)
 make DUT=eth_parser      # the Ethernet layer (3.2)
 make DUT=ipv4_parser     # the IPv4 layer (3.3)
+make DUT=udp_parser      # the UDP layer (3.4)
+make DUT=mold_parser     # the MoldUDP64 layer (3.5)
 make pytests             # pure-Python testbench helpers (frames.py) - no simulator
 make regress             # every testbench: pytests + each RTL block
 make waves               # open the DUT's VCD dump in gtkwave
