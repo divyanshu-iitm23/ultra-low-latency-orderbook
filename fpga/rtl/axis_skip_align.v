@@ -35,15 +35,6 @@ module axis_skip_align #(
     reg               drop_q, bounded_q, done_q;
     reg [15:0]        skip_q, left_q;
 
-    wire first_beat = s_axis_tvalid && !in_frame;
-
-    // per-frame control: from the ports on beat 0, from registers thereafter
-    wire [15:0] skip_c    = first_beat ? skip            : skip_q;
-    wire [15:0] left_c    = first_beat ? keep_len        : left_q;
-    wire        bounded_c = first_beat ? (keep_len != 0) : bounded_q;
-    wire        drop_c    = first_beat ? drop            : drop_q;
-    wire        done_c    = first_beat ? 1'b0            : done_q;
-
     // a finished payload still sitting in the buffer must go out before the
     // next frame is allowed in (it would overwrite the per-frame control regs)
     wire residue = done_q && (cnt_q != 0);
@@ -52,6 +43,15 @@ module axis_skip_align #(
     assign s_axis_tready = !residue && (cnt_q <= BUF_B - KEEP_W) && out_free;
 
     wire beat = s_axis_tvalid && s_axis_tready;
+
+    wire first_beat = beat && !in_frame;
+
+    // per-frame control: from the ports on beat 0, from registers thereafter
+    wire [15:0] skip_c    = first_beat ? skip            : skip_q;
+    wire [15:0] left_c    = first_beat ? keep_len        : left_q;
+    wire        bounded_c = first_beat ? (keep_len != 0) : bounded_q;
+    wire        drop_c    = first_beat ? drop            : drop_q;
+    wire        done_c    = first_beat ? 1'b0            : done_q;
 
     // gather: append this beat's payload bytes
     integer j;

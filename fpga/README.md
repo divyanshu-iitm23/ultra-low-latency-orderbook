@@ -27,7 +27,7 @@ PHASE 3: FPGA UDP Packet PARSER (Hardware)
 │   ├──  3.3  ipv4_parser.v     — IHL skip, proto==17, trim to total_length, checksum      [done]
 │   ├──  3.4  udp_parser.v      — strip 8 B, port filter, trim to UDP length              [done]
 │   ├──  3.5  mold_parser.v     — strip 20 B, sequence-gap strobe, heartbeat / end-of-session [done]
-│   └──  3.6  feed_top.v        — eth → ipv4 → udp → mold → itch_parser (unmodified)
+│   └──  3.6  feed_top.v        — eth → ipv4 → udp → mold → itch_parser (unmodified)     [done]
 │
 └── 4: FPGA vs software comparison
     |
@@ -53,6 +53,7 @@ fpga/
 │   ├── ipv4_parser.v      IPv4 layer: IHL skip, proto/checksum, trim to total_length (3.3)
 │   ├── udp_parser.v       UDP layer: strip 8 B, port filter, trim to length (3.4)
 │   ├── mold_parser.v      MoldUDP64: strip 20 B, seq-gap strobe, heartbeat/EOS (3.5)
+│   ├── feed_top.v         the full chain: eth → ipv4 → udp → mold → itch (3.6)
 │   └── itch_parser.v      streaming ITCH 5.0 message parser
 ├── tb/                    cocotb testbenches (Python)
 │   ├── test_axis_reg.py
@@ -61,6 +62,7 @@ fpga/
 │   ├── test_ipv4_parser.py
 │   ├── test_udp_parser.py
 │   ├── test_mold_parser.py
+│   ├── test_feed_top.py
 │   ├── test_itch_parser.py
 │   ├── frames.py          wire-frame builder + reference unwrap (step-3 stimulus)
 │   └── test_frames.py     self-test for frames.py (pure Python, no simulator)
@@ -399,6 +401,63 @@ concatenated payloads must rebuild **exactly the BinaryFILE stream
 `itch_parser.v` already parses**, with zero gaps flagged on in-order data. That
 last test is the whole front-end's thesis in one assertion.
 
+### 3.6 feed_top.v — the full chain    [done]
+
+**Requirement.** Five verified blocks exist, each tested against its own
+reference-unwrap layer, but nothing yet connects them and nothing has proven
+that a **raw Ethernet frame in → decoded ITCH message out** works through the
+whole stack. `feed_top` is that connection, and its test is the payoff of the
+entire phase.
+
+**Working.** Pure structure — no new datapath logic. The five modules in series,
+`m_axis` of each into `s_axis` of the next:
+
+```
+ s_axis (Ethernet frame)
+   │  strip 14/18     strip IHL      strip 8       strip 20
+   ▼                                                          ┌ msg bundle
+ [eth] ─► [ipv4] ─► [udp] ─► [mold] ─────────────► [itch] ────┤
+                               │                  (UNMODIFIED) └ msg_valid ...
+                               └► hdr_valid · seq · count · seq_gap
+```
+
+`itch_parser.v` is dropped in **completely unmodified** — the thesis of the
+ITCH-first ordering, demonstrated. The one non-obvious correctness argument is
+that itch_parser wants a *continuous* stream but receives per-datagram bursts
+with idle gaps: it works only because MoldUDP64 guarantees whole messages per
+datagram, so at every frame boundary itch_parser's FSM is back in its LEN0 state
+and the next datagram begins with a fresh length prefix. No message ever spans a
+frame.
+
+The test reuses the step-2 golden model over the *whole* chain: build real
+Ethernet frames from ITCH messages, drive `feed_top`, and diff the decoded
+messages against the Phase-1 C++ parser run on the original unwrapped stream.
+Six tests: synthetic and real-capture end-to-end (1500 real messages); dropped
+frames (wrong ethertype/proto/port/checksum, each carrying a real message) that
+must contribute **nothing**; heartbeat/EOS frames that emit nothing; the
+`seq_gap` side-band flagged end-to-end; and the whole chain under a stuttering
+source.
+
+**The bug integration caught — in the gearbox (3.1), not the wiring.** The
+first full-chain run deadlocked after a handful of frames: the source's
+`tready` stuck low with the entire pipe empty and every downstream ready high.
+The cause was in `axis_skip_align`: when a frame left a residue byte in the
+staging buffer and the *next* frame's beat was already waiting (`tvalid` high
+but not yet accepted), `first_beat` fired on mere presence and forced the
+residue-flush condition off — stranding the residue forever. The per-block tests
+never hit it because they always drained idle cycles between frames, so residue
+always flushed before the next frame arrived; only **back-to-back frames through
+the chain** exposed it. The fix is one line — a frame "starts" when its first
+beat is *accepted*, not merely present:
+
+```verilog
+wire first_beat = beat && !in_frame;   // was: s_axis_tvalid && !in_frame
+```
+
+This is exactly what integration testing is for: a hazard invisible to six green
+per-block suites, surfaced the moment the blocks ran shoulder to shoulder at
+line rate.
+
 
 ## Toolchain
 
@@ -426,6 +485,7 @@ make DUT=eth_parser      # the Ethernet layer (3.2)
 make DUT=ipv4_parser     # the IPv4 layer (3.3)
 make DUT=udp_parser      # the UDP layer (3.4)
 make DUT=mold_parser     # the MoldUDP64 layer (3.5)
+make DUT=feed_top        # the full chain end to end (3.6)
 make pytests             # pure-Python testbench helpers (frames.py) - no simulator
 make regress             # every testbench: pytests + each RTL block
 make waves               # open the DUT's VCD dump in gtkwave
